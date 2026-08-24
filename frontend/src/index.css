@@ -1,0 +1,167 @@
+@import 'tailwindcss';
+
+/*
+  FinBit design system, contract section 10.
+  Dark-first, editorial, Swiss minimal. Every colour in the app comes from these
+  tokens: no component file should ever contain a raw hex value.
+*/
+
+:root,
+[data-theme='dark'] {
+  --bg: #0f172a;
+  --card: #111827;
+  --fg: #f8fafc;
+  --muted: #1e293b;
+  --muted-fg: #cbd5e1;
+  --border: #334155;
+  --accent: #1e40af;
+  --on-accent: #ffffff;
+  --breaking: #dc2626;
+  --on-breaking: #ffffff;
+  --bull: #22c55e;
+  --bear: #ef4444;
+  --flat: #94a3b8;
+}
+
+[data-theme='light'] {
+  --bg: #ffffff;
+  --card: #ffffff;
+  --fg: #0f172a;
+  --muted: #f1f5f9;
+  --muted-fg: #475569;
+  --border: #e2e8f0;
+  --accent: #1d4ed8;
+  --on-accent: #ffffff;
+  --breaking: #dc2626;
+  --on-breaking: #ffffff;
+  --bull: #16a34a;
+  --bear: #dc2626;
+  --flat: #64748b;
+}
+
+/*
+  Map the tokens onto Tailwind colour names so components write bg-card,
+  text-muted-fg, border-border, text-bull, text-bear, text-flat, bg-breaking,
+  bg-accent and so on. Opacity modifiers such as bg-bull/10 work as usual.
+  "inline" keeps the utilities pointing at the raw custom properties, so a
+  theme switch on the html element repaints without a rebuild.
+*/
+@theme inline {
+  --color-bg: var(--bg);
+  --color-card: var(--card);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-muted-fg: var(--muted-fg);
+  --color-border: var(--border);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-breaking: var(--breaking);
+  --color-on-breaking: var(--on-breaking);
+  --color-bull: var(--bull);
+  --color-bear: var(--bear);
+  --color-flat: var(--flat);
+
+  --font-sans: 'Roboto', ui-sans-serif, system-ui, 'Segoe UI', Arial, sans-serif;
+  --font-headline: 'Newsreader', ui-serif, Georgia, 'Times New Roman', serif;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    background-color: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-headline);
+    line-height: 1.2;
+    letter-spacing: -0.01em;
+  }
+
+  /* Visible focus ring on everything focusable, in both themes. */
+  :focus-visible {
+    outline: 2px solid var(--fg);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--accent);
+    color: var(--on-accent);
+  }
+
+  /* Numbers, prices and tickers stay column aligned. */
+  time,
+  data,
+  output {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Tabular figures. Tailwind also ships tabular-nums; tnum is the short form. */
+@utility tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* The one-card-per-viewport snap feed. */
+@utility feed-scroll {
+  scroll-snap-type: y mandatory;
+  overscroll-behavior-y: contain;
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+}
+
+@utility feed-snap {
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+
+/* Horizontal chip and tab rails that should not show a scrollbar. */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Bottom navigation and sheets clear the home indicator. */
+@utility pb-safe {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+@utility h-safe-nav {
+  height: calc(4rem + env(safe-area-inset-bottom));
+}
+
+/* Honour reduced motion everywhere, including snap scrolling. */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}

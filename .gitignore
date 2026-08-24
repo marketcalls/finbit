@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# Vite dev config holds no secrets, only the local API base URL
+!frontend/.env.development
 
 # Python / uv
 .venv/

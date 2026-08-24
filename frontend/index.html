@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <title>FinBit, Indian market news in 60 words</title>
+    <meta
+      name="description"
+      content="FinBit compresses Indian and global financial news into card-sized summaries for traders, with market impact, affected symbols and every original source."
+    />
+    <meta name="theme-color" content="#0F172A" />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231E40AF'/%3E%3Cpath d='M11 23V9h10M11 16h7' fill='none' stroke='%23FFFFFF' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600;6..72,700&family=Roboto:wght@300;400;500;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <script>
+      // Resolve the theme before first paint so there is no flash of the wrong palette.
+      (function () {
+        var root = document.documentElement;
+        var theme = 'dark';
+        try {
+          var stored = window.localStorage.getItem('finbit.theme');
+          if (stored === 'light' || stored === 'dark') {
+            theme = stored;
+          } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+            theme = 'light';
+          }
+        } catch (err) {
+          theme = 'dark';
+        }
+        root.setAttribute('data-theme', theme);
+        root.style.colorScheme = theme;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>FinBit needs JavaScript enabled to load the news feed.</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
