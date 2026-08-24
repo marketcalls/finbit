@@ -17,7 +17,10 @@ CREATE TABLE IF NOT EXISTS articles (
   published_at      TEXT    NOT NULL,
   created_at        TEXT    NOT NULL,
   updated_at        TEXT    NOT NULL,
-  dedupe_key        TEXT    NOT NULL
+  dedupe_key        TEXT    NOT NULL,
+  image_url         TEXT,
+  image_source_url  TEXT,
+  image_checked_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_articles_published  ON articles(published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_articles_category   ON articles(category);

@@ -51,7 +51,9 @@ class Settings(BaseSettings):
     ingest_interval_minutes: int = 15
     ingest_queries_per_cycle: int = 4
     ingest_max_stories_per_query: int = 6
-    ingest_concurrency: int = 3
+    # The live Agent API account answers with x-ratelimit-limit: 1, so more
+    # than one request in flight earns a 429. 1 is the safe default.
+    ingest_concurrency: int = 1
     rescore_interval_minutes: int = 30
 
     # Cold start (contract section 13).

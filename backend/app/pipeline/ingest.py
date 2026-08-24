@@ -14,6 +14,11 @@ Command line, run from the backend directory:
     uv run python -m app.pipeline.ingest --once
     uv run python -m app.pipeline.ingest --queries india_markets,rbi --limit 3
     uv run python -m app.pipeline.ingest --rescore
+    uv run python -m app.pipeline.ingest --images
+
+Card images (contract section 14) are resolved between dedupe and persist by
+fetching the Open Graph tag of the source pages the stories already carry.
+That hits publisher websites rather than Perplexity, so it adds no API cost.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from typing import Any
 
 from app import db, repo
 from app.config import get_settings
-from app.pipeline import dedupe, extract, queries, score
+from app.pipeline import dedupe, extract, images, queries, score
 from app.pipeline.perplexity import PerplexityClient, PerplexityError
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,16 @@ CANDIDATE_LIMIT = 500
 
 # Hard ceiling on stories requested from one query, whatever config says.
 MAX_STORIES_PER_QUERY = 20
+
+# How many already stored articles one cycle backfills card images for.
+IMAGE_BACKFILL_LIMIT = 24
+
+# Card image columns carried on a story and written back on a merge.
+IMAGE_FIELDS: tuple[str, ...] = (
+    "image_url",
+    "image_source_url",
+    "image_checked_at",
+)
 
 # The article fields a merge writes back. Identity columns are never touched.
 MERGE_FIELDS: tuple[str, ...] = (
@@ -59,6 +74,7 @@ MERGE_FIELDS: tuple[str, ...] = (
     "topics",
     "sources",
     "impact_map",
+    *IMAGE_FIELDS,
 )
 
 # Rotates the query set across scheduled cycles.
@@ -80,6 +96,7 @@ class QueryOutcome:
     stories_seen: int = 0
     stories_new: int = 0
     stories_merged: int = 0
+    images_found: int = 0
     cost_usd: float = 0.0
     latency_seconds: float = 0.0
     error: str | None = None
@@ -117,6 +134,10 @@ class CycleResult:
         return sum(q.stories_merged for q in self.queries)
 
     @property
+    def images_found(self) -> int:
+        return sum(q.images_found for q in self.queries)
+
+    @property
     def cost_usd(self) -> float:
         return round(sum(q.cost_usd for q in self.queries), 6)
 
@@ -145,14 +166,34 @@ def _new_record(story: dict[str, Any], key: str) -> dict[str, Any]:
         "topics": story.get("topics") or [],
         "sources": story.get("sources") or [],
         "impact_map": story.get("impact_map") or [],
+        "image_url": story.get("image_url"),
+        "image_source_url": story.get("image_source_url"),
+        "image_checked_at": story.get("image_checked_at"),
     }
     record["importance_score"] = score.compute_importance(record)
     return record
 
 
+def _merge_image(
+    merged: dict[str, Any], existing: dict[str, Any], incoming: dict[str, Any]
+) -> None:
+    """Contract 14.2: keep an existing image, otherwise take the incoming one.
+
+    image_checked_at sticks once either side has it, so a cluster that has
+    already been looked at is never refetched.
+    """
+    if not merged.get("image_url") and incoming.get("image_url"):
+        merged["image_url"] = incoming.get("image_url")
+        merged["image_source_url"] = incoming.get("image_source_url")
+    merged["image_checked_at"] = existing.get("image_checked_at") or incoming.get(
+        "image_checked_at"
+    )
+
+
 def _apply_merge(existing: dict[str, Any], story: dict[str, Any]) -> dict[str, Any]:
     """Merge a story into a stored cluster and write the result back."""
     merged = dedupe.merge_articles(existing, story)
+    _merge_image(merged, existing, story)
     merged["importance_score"] = score.compute_importance(merged)
     changes = {name: merged.get(name) for name in MERGE_FIELDS}
     repo.update_article(int(existing["id"]), changes)
@@ -253,6 +294,120 @@ def rescore_recent(window_hours: int | None = None, limit: int | None = None) ->
 
 
 # ---------------------------------------------------------------------------
+# Card images (contract section 14.2)
+# ---------------------------------------------------------------------------
+
+
+def _image_concurrency(concurrency: int | None = None) -> int:
+    """The same bounded concurrency the ingest cycle runs its queries with."""
+    if concurrency is not None:
+        return max(1, int(concurrency))
+    return max(1, int(get_settings().ingest_concurrency))
+
+
+async def resolve_story_images(
+    stories: Sequence[dict[str, Any]], concurrency: int | None = None
+) -> int:
+    """Attach a card image to each story, in place. Returns how many were found.
+
+    Runs after dedupe and before persist, so a new article is inserted with
+    its image already on it. A story whose cluster has been checked before is
+    skipped, hit or miss, which is the 'image_checked_at is not null means
+    never retry' rule from section 14.2.
+
+    Never raises: publisher websites are unreliable and a card without an
+    image still renders.
+    """
+    if not stories:
+        return 0
+    try:
+        keys = [dedupe.dedupe_key(story.get("headline")) for story in stories]
+        checked = await asyncio.to_thread(repo.image_checked_keys, keys)
+        pending = [
+            story
+            for story, key in zip(stories, keys)
+            if key not in checked and not story.get("image_checked_at")
+        ]
+        if not pending:
+            return 0
+        results = await images.resolve_images(
+            [story.get("sources") for story in pending],
+            concurrency=_image_concurrency(concurrency),
+        )
+        stamp = repo.utcnow_iso()
+        found = 0
+        for story, (image_url, page_url) in zip(pending, results):
+            story["image_url"] = image_url
+            story["image_source_url"] = page_url
+            story["image_checked_at"] = stamp
+            if image_url:
+                found += 1
+        logger.info(
+            "card images: %d of %d stories resolved (%d skipped, already checked)",
+            found,
+            len(pending),
+            len(stories) - len(pending),
+        )
+        return found
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - an image is never worth a cycle
+        logger.warning("card image resolution failed: %s: %s", type(exc).__name__, exc)
+        return 0
+
+
+async def backfill_images(
+    limit: int = IMAGE_BACKFILL_LIMIT, concurrency: int | None = None
+) -> int:
+    """Resolve card images for stored articles that were never checked.
+
+    This is what gives articles written before section 14 an image, and it
+    runs exactly once per article: image_checked_at is stamped whether or not
+    an image was found. Returns how many images were found. Never raises.
+    """
+    try:
+        articles = await asyncio.to_thread(
+            repo.articles_needing_images, max(1, int(limit))
+        )
+        if not articles:
+            return 0
+        results = await images.resolve_images(
+            [article.get("sources") for article in articles],
+            concurrency=_image_concurrency(concurrency),
+        )
+        stamp = repo.utcnow_iso()
+        found = 0
+        for article, (image_url, page_url) in zip(articles, results):
+            await asyncio.to_thread(
+                repo.set_article_image,
+                int(article["id"]),
+                image_url,
+                page_url,
+                stamp,
+            )
+            if image_url:
+                found += 1
+        logger.info(
+            "card image backfill: %d of %d articles now have an image",
+            found,
+            len(articles),
+        )
+        return found
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a backfill is never worth a cycle
+        logger.warning("card image backfill failed: %s: %s", type(exc).__name__, exc)
+        return 0
+
+
+def backfill_images_blocking(
+    limit: int = IMAGE_BACKFILL_LIMIT, concurrency: int | None = None
+) -> int:
+    """Run the image backfill from synchronous code, for the CLI."""
+    return asyncio.run(backfill_images(limit, concurrency))
+
+
+# ---------------------------------------------------------------------------
 # The cycle
 # ---------------------------------------------------------------------------
 
@@ -305,6 +460,9 @@ async def _run_one_query(
             extraction = await extract.fetch_stories(query, limit, client=client)
         outcome.cost_usd = extraction.cost_usd
         outcome.stories_seen = len(extraction.stories)
+        # Publisher websites, not Perplexity, so this runs outside the agent
+        # semaphore and never holds a rate limited slot.
+        outcome.images_found = await resolve_story_images(extraction.stories)
         async with _lock():
             new_count, merged_count = await asyncio.to_thread(
                 persist_stories, extraction.stories
@@ -377,6 +535,11 @@ async def run_cycle(
         result.status = "error"
         logger.exception("ingest cycle %d failed", run_id)
 
+    if result.queries and result.error is None:
+        # Articles stored before section 14, or by an earlier cycle that could
+        # not reach a publisher, get one chance at an image each.
+        await backfill_images()
+
     failures = [q for q in result.queries if q.error]
     if result.status != "error":
         result.status = "error" if failures and len(failures) == len(result.queries) else "ok"
@@ -425,18 +588,23 @@ def run_cycle_blocking(
 
 def format_summary(result: CycleResult) -> str:
     """The per-query summary table printed by the CLI."""
-    header = f"{'query':<16}{'seen':>6}{'new':>6}{'merged':>8}{'cost usd':>11}  status"
+    header = (
+        f"{'query':<16}{'seen':>6}{'new':>6}{'merged':>8}{'images':>8}"
+        f"{'cost usd':>11}  status"
+    )
     rule = "-" * len(header)
     lines = [header, rule]
     for outcome in result.queries:
         lines.append(
             f"{outcome.key:<16}{outcome.stories_seen:>6}{outcome.stories_new:>6}"
-            f"{outcome.stories_merged:>8}{outcome.cost_usd:>11.5f}  {outcome.status}"
+            f"{outcome.stories_merged:>8}{outcome.images_found:>8}"
+            f"{outcome.cost_usd:>11.5f}  {outcome.status}"
         )
     lines.append(rule)
     lines.append(
         f"{'total':<16}{result.stories_seen:>6}{result.stories_new:>6}"
-        f"{result.stories_merged:>8}{result.cost_usd:>11.5f}  {result.status}"
+        f"{result.stories_merged:>8}{result.images_found:>8}"
+        f"{result.cost_usd:>11.5f}  {result.status}"
     )
     lines.append(f"run id {result.run_id}, total cost {result.cost_usd:.5f} USD")
     for outcome in result.queries:
@@ -477,6 +645,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="only recompute importance scores, no API calls and no cost.",
     )
     parser.add_argument(
+        "--images",
+        action="store_true",
+        help=(
+            "only resolve card images for stored articles that were never "
+            "checked. Hits publisher websites, not Perplexity, so it is free."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="log every HTTP call and every merge decision.",
@@ -497,6 +673,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"rescored {updated} articles")
         return 0
 
+    if args.images:
+        limit = int(args.limit or repo.DEFAULT_IMAGE_BACKFILL_LIMIT)
+        found = backfill_images_blocking(limit)
+        print(f"resolved {found} card images")
+        return 0
+
     keys = [key.strip() for key in str(args.queries).split(",") if key.strip()]
     unknown = [key for key in keys if queries.get_query(key) is None]
     if unknown:
@@ -512,8 +694,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "CANDIDATE_LIMIT",
     "CycleResult",
+    "IMAGE_BACKFILL_LIMIT",
+    "IMAGE_FIELDS",
     "MERGE_FIELDS",
     "QueryOutcome",
+    "backfill_images",
+    "backfill_images_blocking",
     "build_parser",
     "format_summary",
     "main",
@@ -521,6 +707,7 @@ __all__ = [
     "open_run",
     "persist_stories",
     "rescore_recent",
+    "resolve_story_images",
     "run_cycle",
     "run_cycle_blocking",
 ]

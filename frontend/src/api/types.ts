@@ -80,6 +80,12 @@ export interface ArticleCard {
   published_at: string;
   /** ISO 8601 UTC with a trailing Z. */
   created_at: string;
+  /**
+   * Contract section 14: the Open Graph image resolved from the story's source
+   * pages, hotlinked from the publisher. Null when no source carried one, in
+   * which case the card renders a typographic plate instead.
+   */
+  image_url: string | null;
   bookmarked: boolean;
   symbols: SymbolTag[];
   topics: string[];

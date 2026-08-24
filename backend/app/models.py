@@ -148,6 +148,12 @@ class ArticleCard(BaseModel):
     source_count: int = 0
     published_at: str
     created_at: str
+    image_url: str | None = None
+    """Card image resolved from a source page (contract section 14.4).
+
+    image_source_url and image_checked_at stay internal and are deliberately
+    absent here, so the extra='ignore' config drops them on validation.
+    """
     bookmarked: bool = False
     symbols: list[SymbolTag] = Field(default_factory=list)
     topics: list[str] = Field(default_factory=list)

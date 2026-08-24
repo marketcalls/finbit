@@ -47,6 +47,7 @@ DEFAULT_RESCORE_WINDOW_HOURS = 72
 DEFAULT_RESCORE_LIMIT = 500
 DEFAULT_BOOKMARK_LIMIT = 100
 DEFAULT_RUNS_LIMIT = 20
+DEFAULT_IMAGE_BACKFILL_LIMIT = 50
 
 _SORT_MODES = ("top", "latest")
 _FEED_CATEGORY_KEYS = tuple(c["key"] for c in CATEGORIES)
@@ -55,7 +56,7 @@ _ARTICLE_COLUMNS = """
     a.id, a.story_cluster_id, a.headline, a.summary, a.why_it_matters,
     a.category, a.sentiment, a.impact, a.impact_direction, a.importance_score,
     a.is_breaking, a.source_count, a.published_at, a.created_at, a.updated_at,
-    a.dedupe_key
+    a.dedupe_key, a.image_url, a.image_source_url, a.image_checked_at
 """
 
 _SCALAR_COLUMNS = (
@@ -72,7 +73,14 @@ _SCALAR_COLUMNS = (
     "source_count",
     "published_at",
     "dedupe_key",
+    "image_url",
+    "image_source_url",
+    "image_checked_at",
 )
+
+# Card image columns (contract section 14.3). image_url reaches the API
+# through ArticleCard, the other two are internal to the pipeline.
+_IMAGE_COLUMNS = ("image_url", "image_source_url", "image_checked_at")
 
 _FTS_COLUMNS = ("headline", "summary", "why_it_matters", "symbols_text", "topics_text")
 
@@ -472,6 +480,7 @@ def _base_card(row: sqlite3.Row) -> dict[str, Any]:
         "source_count": int(row["source_count"] or 0),
         "published_at": row["published_at"],
         "created_at": row["created_at"],
+        "image_url": row["image_url"] if "image_url" in keys else None,
         "bookmarked": False,
         "symbols": [],
         "topics": [],
@@ -482,6 +491,12 @@ def _base_card(row: sqlite3.Row) -> dict[str, Any]:
         card["updated_at"] = row["updated_at"]
     if "dedupe_key" in keys:
         card["dedupe_key"] = row["dedupe_key"]
+    # Internal only, like updated_at and dedupe_key above: ArticleCard ignores
+    # extra keys, so these never reach the API (contract section 14.4).
+    if "image_source_url" in keys:
+        card["image_source_url"] = row["image_source_url"]
+    if "image_checked_at" in keys:
+        card["image_checked_at"] = row["image_checked_at"]
     return card
 
 
@@ -607,14 +622,18 @@ def insert_article(article: dict[str, Any]) -> int:
         to_iso_z(article.get("created_at") or now),
         now,
         dedupe_key,
+        _optional_text(article.get("image_url")),
+        _optional_text(article.get("image_source_url")),
+        _optional_text(article.get("image_checked_at")),
     )
 
     with get_conn(write=True) as conn:
         cursor = conn.execute(
             "INSERT INTO articles (story_cluster_id, headline, summary, why_it_matters, "
             "category, sentiment, impact, impact_direction, importance_score, is_breaking, "
-            "source_count, published_at, created_at, updated_at, dedupe_key) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "source_count, published_at, created_at, updated_at, dedupe_key, "
+            "image_url, image_source_url, image_checked_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             values,
         )
         article_id = int(cursor.lastrowid or 0)
@@ -665,6 +684,8 @@ def update_article(article_id: int, changes: dict[str, Any]) -> bool:
                 value = max(0, _as_int(value, 0))
             elif column == "published_at":
                 value = to_iso_z(value)
+            elif column in _IMAGE_COLUMNS:
+                value = _optional_text(value)
             else:
                 value = _text(value)
             assignments.append(f"{column} = ?")
@@ -702,6 +723,77 @@ def set_importance_score(article_id: int, score: int) -> bool:
             (clamped, utcnow_iso(), int(article_id)),
         )
         return cursor.rowcount > 0
+
+
+def set_article_image(
+    article_id: int,
+    image_url: str | None = None,
+    image_source_url: str | None = None,
+    checked_at: str | None = None,
+) -> bool:
+    """Record the card image resolution for one article (contract 14.2).
+
+    `checked_at` defaults to now, and it is always written, even when no image
+    was found, because a non-null image_checked_at is what stops the resolver
+    from refetching a miss on every later pass. Returns False when the id is
+    gone.
+    """
+    stamp = _optional_text(checked_at) or utcnow_iso()
+    with get_conn(write=True) as conn:
+        cursor = conn.execute(
+            "UPDATE articles SET image_url = ?, image_source_url = ?, "
+            "image_checked_at = ?, updated_at = ? WHERE id = ?",
+            (
+                _optional_text(image_url),
+                _optional_text(image_source_url),
+                stamp,
+                utcnow_iso(),
+                int(article_id),
+            ),
+        )
+        return cursor.rowcount > 0
+
+
+def articles_needing_images(
+    limit: int = DEFAULT_IMAGE_BACKFILL_LIMIT,
+) -> list[dict[str, Any]]:
+    """Hydrated articles that have never been checked for a card image.
+
+    Only image_checked_at IS NULL qualifies, so a checked article with no
+    image is never fetched again. Newest first, because that is what the feed
+    shows.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT {_ARTICLE_COLUMNS} FROM articles a WHERE a.image_checked_at IS NULL "
+            f"ORDER BY a.published_at DESC, a.id DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        return _hydrate(conn, rows)
+
+
+def image_checked_keys(dedupe_keys: Iterable[str] | None) -> set[str]:
+    """Which of these dedupe keys already belong to an image-checked article.
+
+    The ingest pipeline uses this to skip resolution for a story that maps to
+    a cluster which has already been looked at, hit or miss.
+    """
+    wanted = [key for key in {_text(k) for k in dedupe_keys or ()} if key]
+    if not wanted:
+        return set()
+    found: set[str] = set()
+    with get_conn() as conn:
+        for chunk in _chunked(wanted):
+            marks = ",".join("?" for _ in chunk)
+            found.update(
+                str(row["dedupe_key"])
+                for row in conn.execute(
+                    f"SELECT dedupe_key FROM articles WHERE dedupe_key IN ({marks}) "
+                    f"AND image_checked_at IS NOT NULL",
+                    chunk,
+                )
+            )
+    return found
 
 
 def delete_article(article_id: int) -> bool:
@@ -1205,6 +1297,7 @@ __all__ = [
     "DEFAULT_BOOKMARK_LIMIT",
     "DEFAULT_DEDUPE_WINDOW_HOURS",
     "DEFAULT_FEED_LIMIT",
+    "DEFAULT_IMAGE_BACKFILL_LIMIT",
     "DEFAULT_RESCORE_LIMIT",
     "DEFAULT_RESCORE_WINDOW_HOURS",
     "DEFAULT_RUNS_LIMIT",
@@ -1214,6 +1307,7 @@ __all__ = [
     "MAX_SEARCH_LIMIT",
     "TRENDING_WINDOW_HOURS",
     "add_bookmark",
+    "articles_needing_images",
     "bookmarked_ids_for_device",
     "category_counts",
     "count_articles",
@@ -1229,6 +1323,7 @@ __all__ = [
     "get_ingest_run",
     "health_stats",
     "insert_article",
+    "image_checked_keys",
     "iso_hours_ago",
     "last_ingest_finished_at",
     "list_bookmarks",
@@ -1243,6 +1338,7 @@ __all__ = [
     "recent_articles_for_rescore",
     "remove_bookmark",
     "search_articles",
+    "set_article_image",
     "set_importance_score",
     "start_ingest_run",
     "to_iso_z",

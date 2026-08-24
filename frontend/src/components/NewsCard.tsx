@@ -1,19 +1,24 @@
 /**
  * The FinBit story card, contract sections 10 and 11.
  *
- * Order of contents, top to bottom: an optional breaking flag, the headline in
- * Newsreader, the 50 to 80 word summary, a Why it matters block when the API
- * sent one, symbol chips, the Market Impact row, a meta line, and a footer with
- * the sources button and the bookmark toggle.
+ * Order of contents, top to bottom: an optional breaking flag, the lead image,
+ * the headline in Newsreader, the 50 to 80 word summary, a Why it matters block
+ * when the API sent one, symbol chips, the Market Impact row, a meta line, and
+ * a footer with the sources button and the bookmark toggle.
+ *
+ * In compact mode the image becomes a 72 px leading thumbnail with the headline
+ * and summary beside it, which is the shape Search and Saved results want.
+ * Everything below that row is unchanged and stays full width.
  *
  * The card itself is not a link or a button. Only the individual controls are
- * interactive.
+ * interactive. The image is never interactive at all, see CardImage.
  */
 
 import { useCallback, useId, useState } from 'react';
 import type { ArticleCard } from '../api/types';
 import { useBookmarks } from '../lib/bookmarks';
 import { absoluteTime, relativeTime } from '../lib/format';
+import { CardImage } from './CardImage';
 import { CATEGORY_LABELS } from './CategoryTabs';
 import { IconAlert, IconBookmark, IconBookmarkFilled, IconChevronRight } from './Icons';
 import { ImpactBadge } from './ImpactBadge';
@@ -68,6 +73,43 @@ export function NewsCard({ article, compact = false, onSelectSymbol }: NewsCardP
     ? 'flex w-full flex-col gap-2.5 rounded-xl border border-border bg-card px-4 py-4'
     : 'feed-snap flex w-full flex-1 flex-col gap-4 border-b border-border bg-card px-5 py-6 md:border-x';
 
+  /*
+    The image, the headline and the summary are built once and then arranged
+    two ways: stacked in full mode, and as a thumbnail row in compact mode.
+    The row needs min-w-0 on the text column, otherwise the flex default of
+    min-width:auto lets a long headline push the layout wider than the card.
+  */
+  const image = (
+    <CardImage
+      src={article.image_url}
+      category={article.category}
+      symbols={article.symbols.map((tag) => tag.symbol)}
+      direction={article.impact_direction}
+      compact={compact}
+    />
+  );
+
+  const headline = (
+    <h2
+      id={headlineId}
+      className={`font-headline font-semibold tracking-tight text-fg ${
+        compact ? 'text-lg leading-snug' : 'text-2xl leading-[1.18] sm:text-[1.75rem]'
+      }`}
+    >
+      {article.headline}
+    </h2>
+  );
+
+  const summary = (
+    <p
+      className={`text-muted-fg ${
+        compact ? 'line-clamp-3 text-sm leading-relaxed' : 'text-[0.975rem] leading-[1.65]'
+      }`}
+    >
+      {article.summary}
+    </p>
+  );
+
   return (
     <article className={shell} aria-labelledby={headlineId}>
       {article.is_breaking ? (
@@ -77,22 +119,21 @@ export function NewsCard({ article, compact = false, onSelectSymbol }: NewsCardP
         </p>
       ) : null}
 
-      <h2
-        id={headlineId}
-        className={`font-headline font-semibold tracking-tight text-fg ${
-          compact ? 'text-lg leading-snug' : 'text-2xl leading-[1.18] sm:text-[1.75rem]'
-        }`}
-      >
-        {article.headline}
-      </h2>
-
-      <p
-        className={`text-muted-fg ${
-          compact ? 'line-clamp-3 text-sm leading-relaxed' : 'text-[0.975rem] leading-[1.65]'
-        }`}
-      >
-        {article.summary}
-      </p>
+      {compact ? (
+        <div className="flex items-start gap-3">
+          {image}
+          <div className="flex min-w-0 flex-1 flex-col gap-2">
+            {headline}
+            {summary}
+          </div>
+        </div>
+      ) : (
+        <>
+          {image}
+          {headline}
+          {summary}
+        </>
+      )}
 
       {article.why_it_matters ? (
         <div className="rounded-md border-l-2 border-accent bg-muted px-3 py-2.5">
