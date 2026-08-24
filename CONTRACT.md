@@ -749,3 +749,99 @@ from `import.meta.env.VITE_API_BASE` with a fallback of
 - `POST /api/admin/ingest` populates the feed from the live Perplexity API.
 - `README.md` covers setup, env vars, run commands, architecture, cost
   expectations and the AI-assessment disclaimer.
+
+---
+
+## 13. Cold start (empty database)
+
+The database ships empty, so the very first run of the app has no news. Every
+layer must handle that deliberately. There are three distinct problems here and
+each needs its own answer.
+
+### 13.1 An empty feed must look intentional, not broken
+
+`GET /api/feed` on an empty database returns `200` with `{"items": [],
+"next_cursor": null, "has_more": false}`. It is never a 404, never a 500.
+
+The frontend distinguishes three empty cases and must not collapse them into one
+generic message:
+
+- **Never ingested** (`/api/health` reports `articles: 0` and
+  `last_ingest_at: null`): copy says the feed has not been filled yet and
+  offers the primary action described in 13.3. This is the expected first-run
+  state and must not read like an error.
+- **Ingest in progress** (`last_ingest_status` is `running`): copy says stories
+  are being fetched and that it takes about a minute, with a polite `aria-live`
+  region and a spinner or skeleton rather than an empty box. Poll `/api/health`
+  every 5 seconds while in this state and refetch the feed once it flips to
+  `ok`. Stop polling after 3 minutes and fall back to the error case.
+- **Filtered to nothing** (`articles > 0` but this category, symbol or search
+  returned none): copy names the active filter and offers to clear it. Never
+  tell a user there is no news when there is news they have filtered out.
+
+The last ingest failing (`last_ingest_status` is `error`) renders `ErrorState`
+with a retry, not `EmptyState`.
+
+### 13.2 The server fills an empty database on startup
+
+`INGEST_ON_STARTUP` (default `true`) makes the FastAPI lifespan schedule one
+ingest cycle immediately instead of waiting a full interval.
+
+It must be conditional, not unconditional, because uvicorn `--reload` restarts
+the process on every file save and an unconditional startup ingest would spend
+real money on every keystroke. Run the startup cycle only when:
+
+- there are zero articles, or
+- the most recent `ingest_runs` row finished longer ago than
+  `INGEST_INTERVAL_MINUTES`.
+
+Otherwise skip it and let the normal schedule take over. Log which branch was
+taken and why, at info level.
+
+The startup cycle is fire-and-forget on the event loop. It must never block
+application startup: the API has to answer `/api/health` while the first ingest
+is still running.
+
+### 13.3 A first-run path that does not require the UI
+
+Two ways to fill the database by hand, both documented in the README:
+
+- `uv run python -m app.pipeline.ingest --once` from `backend/`, which runs a
+  full cycle across all nine queries. This is the recommended seed step. It
+  costs roughly 0.05 USD and takes one to two minutes, and the CLI must print
+  the per-query story counts and the total cost so the spend is never a surprise.
+- `POST /api/admin/ingest`, which the frontend empty state calls behind a
+  button labelled "Fetch latest news".
+
+Because that button spends money, it is gated by `ALLOW_ADMIN_INGEST_FROM_UI`
+(default `true` for local development). When the flag is false the endpoint
+returns `403` and the empty state hides the button, showing the CLI command as
+copyable text instead. The button disables itself while a run is in progress and
+the UI switches to the in-progress state from 13.1.
+
+### 13.4 Degraded mode with no API key
+
+With no `PERPLEXITY_API_KEY` the API still starts and serves an empty feed. The
+scheduler logs one clear warning at startup and does not schedule ingest jobs.
+`/api/health` reports `"ingest_enabled": false` with a `"reason"` string so the
+frontend empty state can say the key is missing rather than blaming the network.
+`POST /api/admin/ingest` returns `503` with a `detail` naming the missing key.
+
+### 13.5 Additions to earlier sections
+
+`/api/health` gains these fields, so section 5's health response becomes:
+
+```json
+{
+  "status": "ok",
+  "articles": 0,
+  "last_ingest_at": null,
+  "last_ingest_status": null,
+  "ingest_running": false,
+  "ingest_enabled": true,
+  "reason": null
+}
+```
+
+New config keys, both in `.env.example` with comments: `INGEST_ON_STARTUP`
+(default `true`) and `ALLOW_ADMIN_INGEST_FROM_UI` (default `true`).
