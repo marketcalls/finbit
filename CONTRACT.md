@@ -845,3 +845,95 @@ frontend empty state can say the key is missing rather than blaming the network.
 
 New config keys, both in `.env.example` with comments: `INGEST_ON_STARTUP`
 (default `true`) and `ALLOW_ADMIN_INGEST_FROM_UI` (default `true`).
+
+---
+
+## 14. Card images
+
+Cards carry a lead image, Inshorts style. This section supersedes anything
+earlier that implied a text-only card.
+
+### 14.1 Where images come from, and why not from Perplexity
+
+The Agent API does not return images. Its image support is input only: you may
+attach an image for the model to analyze. The `search_results` items it returns
+carry exactly `id`, `title`, `url`, `snippet`, `source`, `date` and
+`last_updated`, with no image field. This was confirmed against the live
+endpoint, so do not go looking for one.
+
+Perplexity's separate Sonar API does support `return_images`, but it is a
+different API, it costs an extra call, and it returns image-search hits rather
+than the image belonging to the story. Stock photography on a market news card
+is worse than no image. Do not use it.
+
+Instead, resolve the Open Graph image from the source URLs the pipeline already
+has. Measured hit rate on real Indian financial news sources is 8 in 10, at zero
+API cost. This is the same mechanism every link-preview unfurler uses.
+
+### 14.2 Resolution rules (agent owns `backend/app/pipeline/images.py`)
+
+Input is an article's ordered source list. Output is a single image URL or None.
+
+- Try sources in publisher-tier order from section 8, tier 1 first, so the image
+  comes from the most credible publisher that has one. Stop at the first hit.
+- For each candidate, issue one GET with redirects followed, an 8 second
+  timeout, and a descriptive User-Agent. Stream the response and stop reading at
+  `</head>` or 200 KB, whichever comes first. Never download the whole page.
+- Look for, in priority order: `og:image:secure_url`, `og:image`,
+  `twitter:image`, `twitter:image:src`. Accept only an absolute `http` or
+  `https` value. Resolve a protocol-relative `//host/path` against `https`.
+  Reject `data:` URIs.
+- Cap total work per article at 3 candidate fetches, and run articles with the
+  same bounded concurrency as ingest. A failure is never fatal: log at debug and
+  move on with None.
+- Record `image_url`, `image_source_url` (the page the tag came from) and
+  `image_checked_at`. A non-null `image_checked_at` means do not try again, even
+  when `image_url` is null, so failures are not retried on every rescore.
+- On merge, keep an existing non-null `image_url` rather than replacing it, but
+  if the existing one is null and the incoming cluster has one, take it.
+
+### 14.3 Schema addition
+
+`articles` gains three nullable columns:
+
+```sql
+ALTER TABLE articles ADD COLUMN image_url        TEXT;
+ALTER TABLE articles ADD COLUMN image_source_url TEXT;
+ALTER TABLE articles ADD COLUMN image_checked_at TEXT;
+```
+
+`schema.sql` carries them inline on the CREATE TABLE for a fresh database.
+Because a database may already exist, `db.init_db()` must also run an idempotent
+migration step: read `PRAGMA table_info(articles)` and issue the ALTER only for
+columns that are missing. Adding a column must never destroy data and must never
+raise on a second run.
+
+### 14.4 API addition
+
+`ArticleCard` gains `"image_url": string | null`. It is present on every
+article-bearing endpoint. `image_source_url` and `image_checked_at` are internal
+and are NOT exposed in the API.
+
+### 14.5 Rendering rules
+
+The image is decorative in the accessibility sense: the headline sits directly
+beside it and carries the meaning. Therefore `alt=""`, and the surrounding
+figure is not announced. Do not invent descriptive alt text for an image whose
+content is unknown, and do not repeat the headline into alt.
+
+- Reserve space before load with a fixed 16 by 9 `aspect-ratio` box so the feed
+  never shifts. Cumulative layout shift from images must be zero.
+- `loading="lazy"`, `decoding="async"`, `referrerPolicy="no-referrer"`.
+- While loading, show the muted token as a placeholder, not a spinner.
+- On `onError`, and when `image_url` is null, fall back to a generated
+  placeholder: the muted background, the category label, and the primary symbol
+  set in large tabular figures, tinted by the impact direction token. A broken
+  image icon must never be visible.
+- The image is never the only carrier of information and is never a link target
+  on its own. The existing controls stay the interactive elements.
+- In `compact` mode, used by Search and Saved, the image renders as a small
+  leading thumbnail (fixed square, 72 px) rather than a full-width banner.
+
+Images are hotlinked from the publisher CDN. That is deliberate for an MVP: it
+is what link previews do, and the publisher is always named on the card. Do not
+add a proxy or a cache layer at this stage.
