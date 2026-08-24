@@ -1,0 +1,35 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# uv.lock is intentionally committed for reproducible installs
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+backend/finbit.db*
+
+# Node
+node_modules/
+dist/
+.vite/
+*.local
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
