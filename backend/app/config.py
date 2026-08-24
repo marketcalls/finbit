@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     ingest_concurrency: int = 3
     rescore_interval_minutes: int = 30
 
+    # Cold start (contract section 13).
+    ingest_on_startup: bool = True
+    allow_admin_ingest_from_ui: bool = True
+
     @field_validator("db_path", mode="before")
     @classmethod
     def _coerce_db_path(cls, value: object) -> object:
@@ -107,6 +111,31 @@ class Settings(BaseSettings):
         return bool(self.perplexity_api_key.strip())
 
     @property
+    def missing_key_detail(self) -> str:
+        """The message shown when ingestion is asked for without a key."""
+        return (
+            "PERPLEXITY_API_KEY is not set. Add it to the .env file at the repo "
+            "root before running the ingestion pipeline."
+        )
+
+    @property
+    def ingest_available(self) -> bool:
+        """True when a cycle could actually run: enabled and holding a key."""
+        return self.ingest_enabled and self.has_perplexity_key
+
+    @property
+    def ingest_unavailable_reason(self) -> str | None:
+        """Why ingestion cannot run, or None when it can (contract 13.4).
+
+        The frontend empty state shows this instead of blaming the network.
+        """
+        if not self.has_perplexity_key:
+            return self.missing_key_detail
+        if not self.ingest_enabled:
+            return "INGEST_ENABLED is false, so scheduled ingestion is turned off."
+        return None
+
+    @property
     def schema_path(self) -> Path:
         return SCHEMA_FILE
 
@@ -118,10 +147,7 @@ class Settings(BaseSettings):
         """
         key = self.perplexity_api_key.strip()
         if not key:
-            raise RuntimeError(
-                "PERPLEXITY_API_KEY is not set. Add it to the .env file at the "
-                "repo root before running the ingestion pipeline."
-            )
+            raise RuntimeError(self.missing_key_detail)
         return key
 
 

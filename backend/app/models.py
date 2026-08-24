@@ -206,12 +206,15 @@ class CategoriesResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """GET /api/health"""
+    """GET /api/health, including the cold start fields of contract 13.5."""
 
     status: str = "ok"
     articles: int = 0
     last_ingest_at: str | None = None
     last_ingest_status: IngestStatus | None = None
+    ingest_running: bool = False
+    ingest_enabled: bool = True
+    reason: str | None = None
 
 
 # ---------------------------------------------------------------------------

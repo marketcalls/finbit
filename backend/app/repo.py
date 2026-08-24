@@ -1079,7 +1079,11 @@ def trending(
 
 
 def health_stats() -> dict[str, Any]:
-    """Article count plus the most recent ingest run outcome."""
+    """Article count plus the most recent ingest run outcome.
+
+    ingest_running is true while the newest run row is still open, which is
+    what the cold start empty state polls on (contract 13.1).
+    """
     with get_conn() as conn:
         total_row = conn.execute("SELECT COUNT(*) AS n FROM articles").fetchone()
         run = conn.execute(
@@ -1091,7 +1095,22 @@ def health_stats() -> dict[str, Any]:
         "articles": int(total_row["n"]) if total_row else 0,
         "last_ingest_at": (run["finished_at"] or run["started_at"]) if run else None,
         "last_ingest_status": run["status"] if run else None,
+        "ingest_running": bool(run is not None and run["status"] == "running"),
     }
+
+
+def last_ingest_finished_at() -> str | None:
+    """When the most recent finished run ended, or None if none has finished.
+
+    The startup ingest decision in contract 13.2 reads this so a uvicorn
+    --reload restart does not spend money on every file save.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT finished_at FROM ingest_runs WHERE finished_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return row["finished_at"] if row is not None else None
 
 
 def count_articles() -> int:
@@ -1211,6 +1230,7 @@ __all__ = [
     "health_stats",
     "insert_article",
     "iso_hours_ago",
+    "last_ingest_finished_at",
     "list_bookmarks",
     "list_feed",
     "list_ingest_runs",
