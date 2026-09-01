@@ -1,13 +1,35 @@
 /**
- * Typed fetch wrappers for the FinBit REST API, contract section 5.
- * Every request carries the X-Device-Id header and is bounded by a timeout.
+ * Typed calls into the FinBit REST API, contract section 5.
+ *
+ * Phase 2 moved the transport itself into packages/shared, so the web app and
+ * the Expo app sign requests with one implementation instead of two that drift.
+ * Every function below keeps the name and the signature the screens already
+ * import: the change is entirely underneath. A request now carries the app key,
+ * the device id, a timestamp, a nonce and an HMAC signature rather than a bare
+ * X-Device-Id header, and the device handshake happens on the first call.
+ *
+ * Two policies stay here rather than in the shared client, because they are
+ * specific to a browser:
+ *
+ *   1. A caller signal and the timeout both apply. The shared client drops its
+ *      timeout when the caller owns cancellation, since it cannot combine two
+ *      signals without lib.dom. A browser has AbortController, and the screens
+ *      pass an effect cleanup signal on almost every call, so combining them
+ *      here keeps the phase 1 behaviour where a hung request still fails.
+ *   2. A revoked device is retried once. See recoverRevokedDevice in lib/device.
  */
 
-import { getDeviceId } from '../lib/device';
+import {
+  ApiError,
+  DEFAULT_TIMEOUT_MS,
+  isAbortError,
+  type RequestOptions as SignedOptions,
+} from '@finbit/shared';
+import { apiClient, deviceGeneration, recoverRevokedDevice } from '../lib/device';
 import type {
   ArticleCard,
-  BookmarkToggleResponse,
   BookmarksResponse,
+  BookmarkToggleResponse,
   CategoriesResponse,
   FeedParams,
   FeedResponse,
@@ -16,34 +38,8 @@ import type {
   TrendingResponse,
 } from './types';
 
-const FALLBACK_API_BASE = 'http://127.0.0.1:8000';
-
-/** Base URL of the API, without a trailing slash. */
-export const API_BASE = (import.meta.env.VITE_API_BASE ?? FALLBACK_API_BASE).replace(/\/+$/, '');
-
-/** Default per request timeout in milliseconds. */
-export const DEFAULT_TIMEOUT_MS = 15000;
-
-const FEED_LIMIT_MAX = 50;
-const SEARCH_LIMIT_MAX = 50;
-
-/** An API call that failed. status is 0 for network failures and timeouts. */
-export class ApiError extends Error {
-  readonly status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.name = 'ApiError';
-    this.status = status;
-    // Keeps instanceof working when the class is transpiled down.
-    Object.setPrototypeOf(this, ApiError.prototype);
-  }
-
-  /** True when the request never reached the API (offline, DNS, CORS, timeout). */
-  get isNetworkError(): boolean {
-    return this.status === 0;
-  }
-}
+export { API_BASE } from '../lib/device';
+export { ApiError, DEFAULT_TIMEOUT_MS, isAbortError };
 
 export interface RequestOptions {
   /** Caller signal, for example from a React effect cleanup. */
@@ -52,160 +48,83 @@ export interface RequestOptions {
   timeoutMs?: number;
 }
 
-/** True when an error came from an aborted request rather than a real failure. */
-export function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === 'AbortError';
+/** True for the one failure that a fresh registration can fix. */
+function isRevokedDevice(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401 && error.code === 'device_revoked';
 }
 
-type QueryValue = string | number | boolean | undefined | null;
-
-function buildUrl(path: string, query: Record<string, QueryValue> = {}): string {
-  const search = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) {
-    if (value === undefined || value === null || value === '') {
-      continue;
-    }
-    search.set(key, String(value));
-  }
-  const qs = search.toString();
-  return `${API_BASE}${path}${qs ? `?${qs}` : ''}`;
-}
-
-function clampLimit(limit: number | undefined, max: number): number | undefined {
-  if (limit === undefined) {
-    return undefined;
-  }
-  const rounded = Math.floor(limit);
-  if (!Number.isFinite(rounded) || rounded < 1) {
-    return 1;
-  }
-  return Math.min(rounded, max);
-}
-
-function messageFromPayload(payload: unknown, fallback: string): string {
-  if (typeof payload === 'string' && payload.trim() !== '') {
-    return payload;
-  }
-  if (payload && typeof payload === 'object' && 'detail' in payload) {
-    const detail = (payload as { detail: unknown }).detail;
-    if (typeof detail === 'string' && detail.trim() !== '') {
-      return detail;
-    }
-    if (Array.isArray(detail)) {
-      // FastAPI validation errors: [{ loc, msg, type }, ...]
-      const parts = detail
-        .map((entry) =>
-          entry && typeof entry === 'object' && typeof (entry as { msg?: unknown }).msg === 'string'
-            ? (entry as { msg: string }).msg
-            : null,
-        )
-        .filter((part): part is string => part !== null);
-      if (parts.length > 0) {
-        return parts.join('. ');
-      }
-    }
-  }
-  return fallback;
-}
-
-async function request<T>(
-  path: string,
-  init: RequestInit = {},
-  query: Record<string, QueryValue> = {},
-  options: RequestOptions = {},
+/**
+ * Run one API call with the browser's timeout, cancellation and recovery rules.
+ *
+ * The retry after a revoked device runs at most once, so a server that keeps
+ * rejecting the new device surfaces the error instead of looping. Each attempt
+ * gets its own deadline, which is why a recovered call can take up to twice the
+ * timeout: the alternative is failing a request that was about to succeed.
+ */
+async function call<T>(
+  run: (options: SignedOptions) => Promise<T>,
+  options: RequestOptions,
 ): Promise<T> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const controller = new AbortController();
-  let timedOut = false;
-
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-
   const external = options.signal;
-  const forwardAbort = () => controller.abort();
-  if (external) {
-    if (external.aborted) {
+  let recovered = false;
+
+  for (;;) {
+    const generation = deviceGeneration();
+    const controller = new AbortController();
+    const forwardAbort = () => controller.abort();
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
       controller.abort();
-    } else {
-      external.addEventListener('abort', forwardAbort, { once: true });
-    }
-  }
+    }, timeoutMs);
 
-  const headers = new Headers(init.headers);
-  headers.set('Accept', 'application/json');
-  headers.set('X-Device-Id', getDeviceId());
-  if (init.body !== undefined && init.body !== null) {
-    headers.set('Content-Type', 'application/json');
-  }
-
-  let response: Response;
-  try {
-    response = await fetch(buildUrl(path, query), {
-      ...init,
-      headers,
-      signal: controller.signal,
-      mode: 'cors',
-      credentials: 'omit',
-    });
-  } catch (error) {
-    if (timedOut) {
-      throw new ApiError(0, `The request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+    if (external) {
+      if (external.aborted) {
+        controller.abort();
+      } else {
+        external.addEventListener('abort', forwardAbort, { once: true });
+      }
     }
-    if (external?.aborted) {
-      // Let the caller's cleanup logic swallow this.
-      throw new DOMException('The request was cancelled.', 'AbortError');
-    }
-    throw new ApiError(0, 'Could not reach the FinBit API. Check that the backend is running.');
-  } finally {
-    clearTimeout(timer);
-    external?.removeEventListener('abort', forwardAbort);
-  }
 
-  const raw = await response.text();
-  let payload: unknown = null;
-  if (raw.trim() !== '') {
     try {
-      payload = JSON.parse(raw) as unknown;
-    } catch {
-      payload = null;
+      return await run({ signal: controller.signal });
+    } catch (error) {
+      if (timedOut && external?.aborted !== true) {
+        // The shared client saw a plain abort here, because the timeout was
+        // ours. Say what really happened, or the screen swallows it as a
+        // cancellation and waits forever.
+        throw new ApiError(
+          0,
+          'timeout',
+          `The request timed out after ${Math.round(timeoutMs / 1000)} seconds.`,
+        );
+      }
+      if (!recovered && isRevokedDevice(error)) {
+        recovered = true;
+        await recoverRevokedDevice(generation);
+        continue;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      external?.removeEventListener('abort', forwardAbort);
     }
   }
-
-  if (!response.ok) {
-    throw new ApiError(
-      response.status,
-      messageFromPayload(payload, `Request failed with status ${response.status}.`),
-    );
-  }
-
-  if (payload === null) {
-    throw new ApiError(response.status, 'The API returned a response that could not be read.');
-  }
-
-  return payload as T;
 }
 
 /** GET /api/feed */
-export function getFeed(params: FeedParams = {}, options: RequestOptions = {}): Promise<FeedResponse> {
-  return request<FeedResponse>(
-    '/api/feed',
-    { method: 'GET' },
-    {
-      category: params.category,
-      symbol: params.symbol,
-      sort: params.sort,
-      cursor: params.cursor,
-      limit: clampLimit(params.limit, FEED_LIMIT_MAX),
-    },
-    options,
-  );
+export function getFeed(
+  params: FeedParams = {},
+  options: RequestOptions = {},
+): Promise<FeedResponse> {
+  return call((signed) => apiClient.getFeed(params, signed), options);
 }
 
 /** GET /api/articles/{id} */
 export function getArticle(articleId: number, options: RequestOptions = {}): Promise<ArticleCard> {
-  return request<ArticleCard>(`/api/articles/${articleId}`, { method: 'GET' }, {}, options);
+  return call((signed) => apiClient.getArticle(articleId, signed), options);
 }
 
 /** GET /api/search. The API requires a query of at least two characters. */
@@ -214,27 +133,22 @@ export function search(
   options: RequestOptions & { limit?: number } = {},
 ): Promise<SearchResponse> {
   const { limit, ...requestOptions } = options;
-  return request<SearchResponse>(
-    '/api/search',
-    { method: 'GET' },
-    { q: query.trim(), limit: clampLimit(limit, SEARCH_LIMIT_MAX) },
-    requestOptions,
-  );
+  return call((signed) => apiClient.search(query, { ...signed, limit }), requestOptions);
 }
 
 /** GET /api/trending */
 export function getTrending(options: RequestOptions = {}): Promise<TrendingResponse> {
-  return request<TrendingResponse>('/api/trending', { method: 'GET' }, {}, options);
+  return call((signed) => apiClient.trending(signed), options);
 }
 
 /** GET /api/categories */
 export function getCategories(options: RequestOptions = {}): Promise<CategoriesResponse> {
-  return request<CategoriesResponse>('/api/categories', { method: 'GET' }, {}, options);
+  return call((signed) => apiClient.categories(signed), options);
 }
 
-/** GET /api/bookmarks, newest saved first. */
+/** GET /api/bookmarks, newest saved first. Keyed to this device, no login. */
 export function getBookmarks(options: RequestOptions = {}): Promise<BookmarksResponse> {
-  return request<BookmarksResponse>('/api/bookmarks', { method: 'GET' }, {}, options);
+  return call((signed) => apiClient.listBookmarks(signed), options);
 }
 
 /** POST /api/bookmarks. Idempotent. */
@@ -242,12 +156,7 @@ export function addBookmark(
   articleId: number,
   options: RequestOptions = {},
 ): Promise<BookmarkToggleResponse> {
-  return request<BookmarkToggleResponse>(
-    '/api/bookmarks',
-    { method: 'POST', body: JSON.stringify({ article_id: articleId }) },
-    {},
-    options,
-  );
+  return call((signed) => apiClient.addBookmark(articleId, signed), options);
 }
 
 /** DELETE /api/bookmarks/{article_id}. Idempotent. */
@@ -255,15 +164,10 @@ export function removeBookmark(
   articleId: number,
   options: RequestOptions = {},
 ): Promise<BookmarkToggleResponse> {
-  return request<BookmarkToggleResponse>(
-    `/api/bookmarks/${articleId}`,
-    { method: 'DELETE' },
-    {},
-    options,
-  );
+  return call((signed) => apiClient.removeBookmark(articleId, signed), options);
 }
 
 /** GET /api/health */
 export function getHealth(options: RequestOptions = {}): Promise<HealthResponse> {
-  return request<HealthResponse>('/api/health', { method: 'GET' }, {}, options);
+  return call((signed) => apiClient.health(signed), options);
 }

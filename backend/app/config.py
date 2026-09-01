@@ -24,6 +24,31 @@ SCHEMA_FILE: Path = APP_DIR / "schema.sql"
 DEFAULT_DB_PATH: Path = BACKEND_DIR / "finbit.db"
 DEFAULT_CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
 
+# A secret that still carries the .env.example placeholder counts as unset.
+# Shipping the sample value is the most likely configuration mistake, so it is
+# treated exactly like an empty string rather than silently accepted.
+PLACEHOLDER_PREFIX: str = "change-me"
+
+SECURITY_KEY_NAMES: tuple[str, ...] = (
+    "APP_KEY_MOBILE",
+    "APP_KEY_WEB",
+    "DEVICE_MASTER_KEY",
+    "JWT_SECRET",
+)
+"""The four secrets a signed deployment cannot start without (contract 2, 3.9)."""
+
+UNSIGNED_MODE_WARNING: str = (
+    "REQUIRE_SIGNED_REQUESTS is false. Requests are accepted with an app key "
+    "and a bearer token only, with no HMAC signature and no replay protection. "
+    "This is a development-only switch. Never run a deployment this way."
+)
+
+
+def is_placeholder(value: str | None) -> bool:
+    """True when a secret is empty or still holds its change-me placeholder."""
+    text = (value or "").strip()
+    return not text or text.lower().startswith(PLACEHOLDER_PREFIX)
+
 
 class Settings(BaseSettings):
     """Runtime configuration, all overridable from the environment."""
@@ -60,6 +85,20 @@ class Settings(BaseSettings):
     ingest_on_startup: bool = True
     allow_admin_ingest_from_ui: bool = True
 
+    # Security core (contract 2, sections 3.2 and 3.9). Every secret defaults to
+    # an empty string so importing this module still never fails on a machine
+    # that has not been configured. validate_security() is what refuses to start
+    # a deployment that is missing one.
+    app_key_mobile: str = ""
+    app_key_web: str = ""
+    device_master_key: str = ""
+    jwt_secret: str = ""
+    admin_bootstrap_username: str = ""
+    admin_bootstrap_password: str = ""
+    signature_skew_seconds: int = 120
+    nonce_ttl_seconds: int = 300
+    require_signed_requests: bool = True
+
     @field_validator("db_path", mode="before")
     @classmethod
     def _coerce_db_path(cls, value: object) -> object:
@@ -88,6 +127,12 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _at_least_one(cls, value: int) -> int:
+        return max(1, int(value))
+
+    @field_validator("signature_skew_seconds", "nonce_ttl_seconds", mode="after")
+    @classmethod
+    def _positive_seconds(cls, value: int) -> int:
+        """A zero or negative window would disable replay protection entirely."""
         return max(1, int(value))
 
     @property
@@ -152,6 +197,61 @@ class Settings(BaseSettings):
             raise RuntimeError(self.missing_key_detail)
         return key
 
+    # -----------------------------------------------------------------------
+    # Security core (contract 2, section 3)
+    # -----------------------------------------------------------------------
+
+    @property
+    def app_keys(self) -> dict[str, str]:
+        """Configured app key to app id, skipping anything still unset.
+
+        An unset key must never match an empty or placeholder X-App-Key header,
+        so placeholders are dropped here rather than compared later.
+        """
+        pairs = ((self.app_key_mobile, "mobile"), (self.app_key_web, "web"))
+        return {key.strip(): app_id for key, app_id in pairs if not is_placeholder(key)}
+
+    @property
+    def has_admin_bootstrap(self) -> bool:
+        """True when both bootstrap variables are set (contract 2, 3.8)."""
+        return bool(
+            self.admin_bootstrap_username.strip()
+            and self.admin_bootstrap_password.strip()
+        )
+
+    @property
+    def security_configured(self) -> bool:
+        """True when every secret a signed deployment needs is present."""
+        return not self.validate_security()
+
+    def validate_security(self) -> list[str]:
+        """Return the configuration problems that must stop startup.
+
+        Empty list means the process may start. Signed mode is the only mode
+        that requires the four secrets, so an unsigned development run returns
+        no problems and the caller logs UNSIGNED_MODE_WARNING instead.
+
+        The returned sentences name the missing variable and never quote its
+        value, so this can be logged safely.
+        """
+        if not self.require_signed_requests:
+            return []
+        values = {
+            "APP_KEY_MOBILE": self.app_key_mobile,
+            "APP_KEY_WEB": self.app_key_web,
+            "DEVICE_MASTER_KEY": self.device_master_key,
+            "JWT_SECRET": self.jwt_secret,
+        }
+        problems: list[str] = []
+        for name in SECURITY_KEY_NAMES:
+            if is_placeholder(values[name]):
+                problems.append(
+                    f"{name} is empty or still set to its change-me placeholder. "
+                    f"Set a real value in the .env file at the repo root, or set "
+                    f"REQUIRE_SIGNED_REQUESTS=false for local development only."
+                )
+        return problems
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -170,9 +270,13 @@ __all__ = [
     "DEFAULT_CORS_ORIGINS",
     "DEFAULT_DB_PATH",
     "ENV_FILE",
+    "PLACEHOLDER_PREFIX",
     "REPO_ROOT",
     "SCHEMA_FILE",
+    "SECURITY_KEY_NAMES",
     "Settings",
+    "UNSIGNED_MODE_WARNING",
     "get_settings",
+    "is_placeholder",
     "reset_settings_cache",
 ]

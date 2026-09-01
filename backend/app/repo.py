@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
@@ -20,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-from app.db import get_conn
+from app.db import get_conn, get_db_path, table_columns
 from app.models import (
     CATEGORIES,
     CATEGORY_KEYS,
@@ -86,6 +87,70 @@ _FTS_COLUMNS = ("headline", "summary", "why_it_matters", "symbols_text", "topics
 
 _SYMBOL_RE = re.compile(r"^[A-Z0-9&-]{1,20}$")
 _WORD_RE = re.compile(r"[A-Za-z0-9&]+")
+
+# ---------------------------------------------------------------------------
+# Moderation visibility (contract 2, sections 4 and 6)
+#
+# articles.hidden and articles.pinned are added by app/migrate.py, not by
+# schema.sql, because ALTER TABLE has no IF NOT EXISTS form. A database that
+# has not been migrated yet therefore has neither column, and a query naming
+# them would fail with "no such column" rather than simply returning rows.
+#
+# Every public read below asks _moderation_ready() first and falls back to the
+# phase 1 SQL when the columns are absent, so the reads keep working against an
+# older database and against any caller that creates a schema without running
+# the migration. Only a positive answer is cached: once the columns exist they
+# never go away, while a negative answer must be rechecked because the very
+# next thing that happens may be the migration adding them.
+# ---------------------------------------------------------------------------
+
+_MODERATION_READY: set[str] = set()
+
+_MODERATION_COLUMNS = ("hidden", "pinned", "moderated_at", "moderated_by")
+
+_ADMIN_ARTICLE_COLUMNS = (
+    _ARTICLE_COLUMNS + ", a.hidden, a.pinned, a.moderated_at, a.moderated_by"
+)
+
+_ADMIN_SORT_MODES = ("top", "latest", "oldest")
+
+# The feed rank for sort=top, folding the pin flag into the score so one
+# integer orders pinned articles first. importance_score is clamped to 0..100
+# on every write, so the 1000 step can never be reached by a score alone.
+_PIN_RANK_STEP = 1000
+_FEED_RANK_TOP = f"(a.pinned * {_PIN_RANK_STEP} + a.importance_score)"
+
+DEFAULT_ADMIN_ARTICLE_LIMIT = 50
+MAX_ADMIN_ARTICLE_LIMIT = 200
+DEFAULT_AUDIT_LIMIT = 50
+MAX_AUDIT_DETAIL_LENGTH = 2000
+
+
+def _moderation_ready(conn: sqlite3.Connection) -> bool:
+    """True when articles carries the phase 2 moderation columns."""
+    path = str(get_db_path())
+    if path in _MODERATION_READY:
+        return True
+    columns = set(table_columns(conn, "articles"))
+    ready = all(name in columns for name in _MODERATION_COLUMNS)
+    if ready:
+        _MODERATION_READY.add(path)
+    return ready
+
+
+def _visible_clause(conn: sqlite3.Connection, alias: str = "a") -> str:
+    """The hidden filter for a public read, or an empty string before migration.
+
+    Pass an empty alias for a query with no table alias.
+    """
+    if not _moderation_ready(conn):
+        return ""
+    return f"{alias}.hidden = 0" if alias else "hidden = 0"
+
+
+def reset_moderation_cache() -> None:
+    """Forget which databases are known to be migrated. For tests only."""
+    _MODERATION_READY.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -814,10 +879,18 @@ def delete_article(article_id: int) -> bool:
 
 
 def get_article(article_id: int, device_id: str | None = None) -> dict[str, Any] | None:
-    """One hydrated article, or None when the id does not exist."""
+    """One hydrated article, or None when the id does not exist.
+
+    A hidden article reads as missing here, so moderating a story also closes
+    the deep link to it. The admin screens use admin_get_article, which sees
+    everything.
+    """
     with get_conn() as conn:
+        visible = _visible_clause(conn)
+        clause = f" AND {visible}" if visible else ""
         row = conn.execute(
-            f"SELECT {_ARTICLE_COLUMNS} FROM articles a WHERE a.id = ?", (int(article_id),)
+            f"SELECT {_ARTICLE_COLUMNS} FROM articles a WHERE a.id = ?{clause}",
+            (int(article_id),),
         ).fetchone()
         if row is None:
             return None
@@ -908,6 +981,13 @@ def list_feed(
     sort='latest' orders by published_at DESC, id DESC.
     An unknown category, an unknown sort or an unparsable cursor is ignored
     rather than raising.
+
+    Hidden articles never appear, and pinned ones sort ahead of the rest inside
+    whichever mode was asked for. The cursor keeps its phase 1 shape, so the
+    rank it carries folds the pin flag into one comparable value: pinned adds
+    1000 to a score that can only reach 100, which orders exactly the same way
+    as pinned DESC, importance_score DESC without needing a fourth cursor
+    field. In latest mode the rank slot carries the pin flag on its own.
     """
     key = _text(category, "all").lower()
     if key not in _FEED_CATEGORY_KEYS:
@@ -916,53 +996,71 @@ def list_feed(
     if mode not in _SORT_MODES:
         mode = "top"
     size = max(1, min(MAX_FEED_LIMIT, _as_int(limit, DEFAULT_FEED_LIMIT)))
-
-    where: list[str] = []
-    params: list[Any] = []
-    if key != "all":
-        where.append("a.category = ?")
-        params.append(key)
-    ticker = _text(symbol).upper()
-    if ticker:
-        where.append(
-            "EXISTS (SELECT 1 FROM article_symbols s "
-            "WHERE s.article_id = a.id AND s.symbol = ?)"
-        )
-        params.append(ticker)
-
     decoded = decode_cursor(cursor)
-    if decoded is not None:
-        primary, published_at, last_id = decoded
-        if mode == "top":
-            try:
-                score = int(primary)
-            except (TypeError, ValueError):
-                score = None
-            if score is not None:
-                where.append(
-                    "(a.importance_score < ? OR "
-                    "(a.importance_score = ? AND a.published_at < ?) OR "
-                    "(a.importance_score = ? AND a.published_at = ? AND a.id < ?))"
-                )
-                params.extend([score, score, published_at, score, published_at, last_id])
-        else:
-            where.append(
-                "(a.published_at < ? OR (a.published_at = ? AND a.id < ?))"
-            )
-            params.extend([published_at, published_at, last_id])
-
-    order = (
-        "a.importance_score DESC, a.published_at DESC, a.id DESC"
-        if mode == "top"
-        else "a.published_at DESC, a.id DESC"
-    )
-    clause = f"WHERE {' AND '.join(where)}" if where else ""
-    params.append(size + 1)
 
     with get_conn() as conn:
+        moderated = _moderation_ready(conn)
+        rank = _FEED_RANK_TOP if moderated else "a.importance_score"
+
+        where: list[str] = []
+        params: list[Any] = []
+        if moderated:
+            where.append("a.hidden = 0")
+        if key != "all":
+            where.append("a.category = ?")
+            params.append(key)
+        ticker = _text(symbol).upper()
+        if ticker:
+            where.append(
+                "EXISTS (SELECT 1 FROM article_symbols s "
+                "WHERE s.article_id = a.id AND s.symbol = ?)"
+            )
+            params.append(ticker)
+
+        if decoded is not None:
+            primary, published_at, last_id = decoded
+            try:
+                marker: int | None = int(primary)
+            except (TypeError, ValueError):
+                marker = None
+            if mode == "top" and marker is not None:
+                where.append(
+                    f"({rank} < ? OR "
+                    f"({rank} = ? AND a.published_at < ?) OR "
+                    f"({rank} = ? AND a.published_at = ? AND a.id < ?))"
+                )
+                params.extend(
+                    [marker, marker, published_at, marker, published_at, last_id]
+                )
+            elif mode == "latest" and moderated and marker is not None:
+                # A phase 1 cursor carries the timestamp in this slot, so an
+                # unparsable marker falls through to the plain comparison
+                # below rather than dropping the page.
+                where.append(
+                    "(a.pinned < ? OR "
+                    "(a.pinned = ? AND a.published_at < ?) OR "
+                    "(a.pinned = ? AND a.published_at = ? AND a.id < ?))"
+                )
+                params.extend(
+                    [marker, marker, published_at, marker, published_at, last_id]
+                )
+            elif mode == "latest":
+                where.append("(a.published_at < ? OR (a.published_at = ? AND a.id < ?))")
+                params.extend([published_at, published_at, last_id])
+
+        pin_first = "a.pinned DESC, " if moderated else ""
+        order = (
+            f"{pin_first}a.importance_score DESC, a.published_at DESC, a.id DESC"
+            if mode == "top"
+            else f"{pin_first}a.published_at DESC, a.id DESC"
+        )
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        params.append(size + 1)
+
+        marker_column = rank if mode == "top" else ("a.pinned" if moderated else "0")
         rows = conn.execute(
-            f"SELECT {_ARTICLE_COLUMNS} FROM articles a {clause} "
-            f"ORDER BY {order} LIMIT ?",
+            f"SELECT {_ARTICLE_COLUMNS}, {marker_column} AS feed_rank "
+            f"FROM articles a {clause} ORDER BY {order} LIMIT ?",
             params,
         ).fetchall()
         has_more = len(rows) > size
@@ -972,7 +1070,10 @@ def list_feed(
     next_cursor: str | None = None
     if has_more and items:
         last = items[-1]
-        primary_value = last["importance_score"] if mode == "top" else last["published_at"]
+        if mode == "top" or moderated:
+            primary_value: Any = int(rows[-1]["feed_rank"] or 0)
+        else:
+            primary_value = last["published_at"]
         next_cursor = encode_cursor(primary_value, last["published_at"], last["id"])
     return {"items": items, "next_cursor": next_cursor, "has_more": has_more}
 
@@ -986,6 +1087,9 @@ def search_articles(
 
     Uses the FTS5 index and falls back to a LIKE scan when the index is empty
     or the query is not valid FTS syntax. Never raises on user input.
+
+    Hidden articles are filtered out and pinned ones lead the results, so a
+    moderation decision applies to search exactly as it does to the feed.
     """
     text = _text(query)
     size = max(1, min(MAX_SEARCH_LIMIT, _as_int(limit, DEFAULT_SEARCH_LIMIT)))
@@ -994,6 +1098,10 @@ def search_articles(
 
     terms = _WORD_RE.findall(text)
     with get_conn() as conn:
+        visible = _visible_clause(conn)
+        fts_filter = f" AND {visible}" if visible else ""
+        like_filter = f"{visible} AND " if visible else ""
+        pin_first = "a.pinned DESC, " if visible else ""
         rows: list[sqlite3.Row] = []
         if terms:
             match = " ".join(f'"{term}"*' for term in terms[:12])
@@ -1001,8 +1109,8 @@ def search_articles(
                 found = conn.execute(
                     f"SELECT {_ARTICLE_COLUMNS}, bm25(articles_fts) AS rank_score "
                     f"FROM articles_fts JOIN articles a ON a.id = articles_fts.rowid "
-                    f"WHERE articles_fts MATCH ? "
-                    f"ORDER BY rank_score ASC, a.published_at DESC LIMIT ?",
+                    f"WHERE articles_fts MATCH ?{fts_filter} "
+                    f"ORDER BY {pin_first}rank_score ASC, a.published_at DESC LIMIT ?",
                     (match, size * 2),
                 ).fetchall()
             except sqlite3.Error:
@@ -1020,15 +1128,16 @@ def search_articles(
         if not rows:
             pattern = "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
             rows = conn.execute(
-                f"SELECT {_ARTICLE_COLUMNS} FROM articles a WHERE "
+                f"SELECT {_ARTICLE_COLUMNS} FROM articles a WHERE {like_filter}("
                 f"a.headline LIKE ? ESCAPE '\\' OR a.summary LIKE ? ESCAPE '\\' "
                 f"OR IFNULL(a.why_it_matters, '') LIKE ? ESCAPE '\\' "
                 f"OR EXISTS (SELECT 1 FROM article_symbols s WHERE s.article_id = a.id "
                 f"AND s.symbol LIKE ? ESCAPE '\\') "
                 f"OR EXISTS (SELECT 1 FROM article_topics at JOIN topics t "
                 f"ON t.id = at.topic_id WHERE at.article_id = a.id "
-                f"AND t.name LIKE ? ESCAPE '\\') "
-                f"ORDER BY a.importance_score DESC, a.published_at DESC, a.id DESC LIMIT ?",
+                f"AND t.name LIKE ? ESCAPE '\\')) "
+                f"ORDER BY {pin_first}a.importance_score DESC, a.published_at DESC, "
+                f"a.id DESC LIMIT ?",
                 (pattern, pattern, pattern, pattern, pattern, size),
             ).fetchall()
         return _hydrate(conn, rows, device_id)
@@ -1042,15 +1151,22 @@ def search_articles(
 def list_bookmarks(
     device_id: str, limit: int = DEFAULT_BOOKMARK_LIMIT
 ) -> list[dict[str, Any]]:
-    """Hydrated bookmarked articles for one device, newest saved first."""
+    """Hydrated bookmarked articles for one device, newest saved first.
+
+    A hidden article drops out of the saved list too. The bookmark row stays,
+    so unhiding the story brings it back where the reader left it.
+    """
     device = _text(device_id)
     if not device:
         return []
     with get_conn() as conn:
+        visible = _visible_clause(conn)
+        clause = f" AND {visible}" if visible else ""
+        pin_first = "a.pinned DESC, " if visible else ""
         rows = conn.execute(
             f"SELECT {_ARTICLE_COLUMNS} FROM bookmarks b "
-            f"JOIN articles a ON a.id = b.article_id WHERE b.device_id = ? "
-            f"ORDER BY b.created_at DESC, b.id DESC LIMIT ?",
+            f"JOIN articles a ON a.id = b.article_id WHERE b.device_id = ?{clause} "
+            f"ORDER BY {pin_first}b.created_at DESC, b.id DESC LIMIT ?",
             (device, max(1, int(limit))),
         ).fetchall()
         return _hydrate(conn, rows, device_id=device, bookmarked=True)
@@ -1115,12 +1231,20 @@ def bookmarked_ids_for_device(
 
 
 def category_counts() -> list[dict[str, Any]]:
-    """Every category in display order with its article count, 'all' first."""
+    """Every category in display order with its article count, 'all' first.
+
+    Hidden articles are left out of the counts, so a tab never advertises
+    stories the feed will not show.
+    """
     with get_conn() as conn:
+        visible = _visible_clause(conn, alias="")
+        clause = f" WHERE {visible}" if visible else ""
         rows = conn.execute(
-            "SELECT category, COUNT(*) AS n FROM articles GROUP BY category"
+            f"SELECT category, COUNT(*) AS n FROM articles{clause} GROUP BY category"
         ).fetchall()
-        total_row = conn.execute("SELECT COUNT(*) AS n FROM articles").fetchone()
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM articles{clause}"
+        ).fetchone()
     counts = {r["category"]: int(r["n"]) for r in rows}
     total = int(total_row["n"]) if total_row else 0
     result: list[dict[str, Any]] = []
@@ -1144,26 +1268,32 @@ def market_filters() -> list[dict[str, str]]:
 def trending(
     window_hours: int = TRENDING_WINDOW_HOURS, limit: int = DEFAULT_TRENDING_LIMIT
 ) -> dict[str, list[str]]:
-    """Most frequent symbols and topics inside the window. Returns {symbols, topics}."""
+    """Most frequent symbols and topics inside the window. Returns {symbols, topics}.
+
+    Hidden articles do not count, so a trending chip never leads to an empty
+    result list.
+    """
     cutoff = iso_hours_ago(window_hours)
     size = max(1, int(limit))
     with get_conn() as conn:
+        visible = _visible_clause(conn)
+        clause = f" AND {visible}" if visible else ""
         symbols = [
             r["symbol"]
             for r in conn.execute(
-                "SELECT s.symbol AS symbol, COUNT(*) AS n FROM article_symbols s "
-                "JOIN articles a ON a.id = s.article_id WHERE a.published_at >= ? "
-                "GROUP BY s.symbol ORDER BY n DESC, s.symbol ASC LIMIT ?",
+                f"SELECT s.symbol AS symbol, COUNT(*) AS n FROM article_symbols s "
+                f"JOIN articles a ON a.id = s.article_id WHERE a.published_at >= ?"
+                f"{clause} GROUP BY s.symbol ORDER BY n DESC, s.symbol ASC LIMIT ?",
                 (cutoff, size),
             )
         ]
         topics = [
             r["name"]
             for r in conn.execute(
-                "SELECT t.name AS name, COUNT(*) AS n FROM article_topics at "
-                "JOIN topics t ON t.id = at.topic_id "
-                "JOIN articles a ON a.id = at.article_id WHERE a.published_at >= ? "
-                "GROUP BY t.name ORDER BY n DESC, t.name ASC LIMIT ?",
+                f"SELECT t.name AS name, COUNT(*) AS n FROM article_topics at "
+                f"JOIN topics t ON t.id = at.topic_id "
+                f"JOIN articles a ON a.id = at.article_id WHERE a.published_at >= ?"
+                f"{clause} GROUP BY t.name ORDER BY n DESC, t.name ASC LIMIT ?",
                 (cutoff, size),
             )
         ]
@@ -1293,7 +1423,416 @@ def list_ingest_runs(limit: int = DEFAULT_RUNS_LIMIT) -> list[dict[str, Any]]:
     return [_run_to_dict(row) for row in rows]
 
 
+# ---------------------------------------------------------------------------
+# Admin content moderation (contract 2, section 6.5)
+#
+# These are the only reads that see a hidden article. Everything above filters
+# them out, so the split is deliberate: a route that wants the moderation view
+# has to ask for it by name.
+# ---------------------------------------------------------------------------
+
+
+def _admin_columns(conn: sqlite3.Connection) -> str:
+    """The select list for an admin read, with the moderation columns if present."""
+    return _ADMIN_ARTICLE_COLUMNS if _moderation_ready(conn) else _ARTICLE_COLUMNS
+
+
+def _attach_moderation(
+    cards: list[dict[str, Any]], rows: Sequence[sqlite3.Row]
+) -> list[dict[str, Any]]:
+    """Copy hidden, pinned and the moderation stamps onto hydrated cards.
+
+    A database that predates the migration has none of these columns, so the
+    fields fall back to the same values a fresh row would carry and the admin
+    screens still render.
+    """
+    by_id = {int(row["id"]): row for row in rows}
+    for card in cards:
+        row = by_id.get(card["id"])
+        keys = row.keys() if row is not None else ()
+        card["hidden"] = bool(row["hidden"]) if "hidden" in keys else False
+        card["pinned"] = bool(row["pinned"]) if "pinned" in keys else False
+        card["moderated_at"] = row["moderated_at"] if "moderated_at" in keys else None
+        card["moderated_by"] = row["moderated_by"] if "moderated_by" in keys else None
+        card.setdefault("dedupe_key", "")
+    return cards
+
+
+def admin_get_article(article_id: int) -> dict[str, Any] | None:
+    """One hydrated article including hidden ones, with its moderation state."""
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT {_admin_columns(conn)} FROM articles a WHERE a.id = ?",
+            (int(article_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return _attach_moderation(_hydrate(conn, [row]), [row])[0]
+
+
+def admin_list_articles(
+    q: str | None = None,
+    category: str | None = None,
+    hidden: bool | None = None,
+    pinned: bool | None = None,
+    sort: str = "latest",
+    cursor: str | None = None,
+    limit: int = DEFAULT_ADMIN_ARTICLE_LIMIT,
+) -> dict[str, Any]:
+    """The moderation table: {items, next_cursor, has_more}.
+
+    Every filter is optional and an unknown value is ignored rather than
+    raising, the same rule the public feed follows. sort is top, latest or
+    oldest, and the cursor is the same opaque keyset format the feed uses.
+    """
+    mode = _text(sort, "latest").lower()
+    if mode not in _ADMIN_SORT_MODES:
+        mode = "latest"
+    size = max(1, min(MAX_ADMIN_ARTICLE_LIMIT, _as_int(limit, DEFAULT_ADMIN_ARTICLE_LIMIT)))
+    decoded = decode_cursor(cursor)
+
+    with get_conn() as conn:
+        moderated = _moderation_ready(conn)
+        where: list[str] = []
+        params: list[Any] = []
+
+        text = _text(q)
+        if text:
+            pattern = (
+                "%"
+                + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                + "%"
+            )
+            where.append(
+                "(a.headline LIKE ? ESCAPE '\\' OR a.summary LIKE ? ESCAPE '\\')"
+            )
+            params.extend([pattern, pattern])
+
+        key = _text(category).lower()
+        if key and key in CATEGORY_KEYS:
+            where.append("a.category = ?")
+            params.append(key)
+
+        if moderated and hidden is not None:
+            where.append("a.hidden = ?")
+            params.append(1 if hidden else 0)
+        if moderated and pinned is not None:
+            where.append("a.pinned = ?")
+            params.append(1 if pinned else 0)
+
+        if decoded is not None:
+            primary, published_at, last_id = decoded
+            if mode == "top":
+                try:
+                    marker = int(primary)
+                except (TypeError, ValueError):
+                    marker = None
+                if marker is not None:
+                    where.append(
+                        "(a.importance_score < ? OR "
+                        "(a.importance_score = ? AND a.published_at < ?) OR "
+                        "(a.importance_score = ? AND a.published_at = ? AND a.id < ?))"
+                    )
+                    params.extend(
+                        [marker, marker, published_at, marker, published_at, last_id]
+                    )
+            elif mode == "oldest":
+                where.append("(a.published_at > ? OR (a.published_at = ? AND a.id > ?))")
+                params.extend([published_at, published_at, last_id])
+            else:
+                where.append("(a.published_at < ? OR (a.published_at = ? AND a.id < ?))")
+                params.extend([published_at, published_at, last_id])
+
+        if mode == "top":
+            order = "a.importance_score DESC, a.published_at DESC, a.id DESC"
+        elif mode == "oldest":
+            order = "a.published_at ASC, a.id ASC"
+        else:
+            order = "a.published_at DESC, a.id DESC"
+
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        params.append(size + 1)
+        rows = conn.execute(
+            f"SELECT {_admin_columns(conn)} FROM articles a {clause} "
+            f"ORDER BY {order} LIMIT ?",
+            params,
+        ).fetchall()
+        has_more = len(rows) > size
+        rows = rows[:size]
+        items = _attach_moderation(_hydrate(conn, rows), rows)
+
+    next_cursor: str | None = None
+    if has_more and items:
+        last = items[-1]
+        primary_value = last["importance_score"] if mode == "top" else last["published_at"]
+        next_cursor = encode_cursor(primary_value, last["published_at"], last["id"])
+    return {"items": items, "next_cursor": next_cursor, "has_more": has_more}
+
+
+def mark_moderated(
+    article_id: int,
+    hidden: bool | None = None,
+    pinned: bool | None = None,
+    actor: str | None = None,
+) -> bool:
+    """Set the hidden and pinned flags and stamp who moderated the article.
+
+    Passing neither flag still records the moderation stamp, which is what an
+    edit to the headline or the summary needs. Returns False when the id is
+    gone.
+    """
+    with get_conn(write=True) as conn:
+        if not _moderation_ready(conn):
+            return False
+        assignments = ["moderated_at = ?", "moderated_by = ?", "updated_at = ?"]
+        stamp = utcnow_iso()
+        params: list[Any] = [stamp, _optional_text(actor), stamp]
+        if hidden is not None:
+            assignments.insert(0, "hidden = ?")
+            params.insert(0, 1 if hidden else 0)
+        if pinned is not None:
+            assignments.insert(0, "pinned = ?")
+            params.insert(0, 1 if pinned else 0)
+        params.append(int(article_id))
+        cursor = conn.execute(
+            f"UPDATE articles SET {', '.join(assignments)} WHERE id = ?", params
+        )
+        return cursor.rowcount > 0
+
+
+def article_siblings(
+    article_id: int, story_cluster_id: str, dedupe_key: str
+) -> list[dict[str, Any]]:
+    """Other articles in the same cluster, newest first.
+
+    A cluster is normally one row, because the pipeline merges rather than
+    inserts. A sibling therefore means the deduplication let two rows through,
+    which is exactly what the admin cluster view exists to show.
+    """
+    cluster = _text(story_cluster_id)
+    key = _text(dedupe_key)
+    if not cluster and not key:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT {_admin_columns(conn)} FROM articles a "
+            f"WHERE a.id != ? AND (a.story_cluster_id = ? OR a.dedupe_key = ?) "
+            f"ORDER BY a.published_at DESC, a.id DESC LIMIT 20",
+            (int(article_id), cluster, key),
+        ).fetchall()
+        return _attach_moderation(_hydrate(conn, rows), rows)
+
+
+# ---------------------------------------------------------------------------
+# Runtime settings (contract 2, section 5)
+#
+# The value column holds JSON text. Encoding and decoding belongs to
+# app.pipeline.settings_bridge, which owns which keys are overridable at all.
+# ---------------------------------------------------------------------------
+
+
+def get_app_setting(key: str) -> str | None:
+    """The raw stored text of one setting, or None when there is no override."""
+    name = _text(key)
+    if not name:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?", (name,)
+        ).fetchone()
+    return str(row["value"]) if row is not None else None
+
+
+def all_app_settings() -> dict[str, str]:
+    """Every stored override as raw text, keyed by setting name."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    return {str(row["key"]): str(row["value"]) for row in rows}
+
+
+def set_app_setting(key: str, value: str, actor: str | None = None) -> None:
+    """Write one override, recording who changed it and when."""
+    name = _text(key)
+    if not name:
+        raise ValueError("an app setting needs a key")
+    with get_conn(write=True) as conn:
+        conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at, updated_by) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
+            "value = excluded.value, updated_at = excluded.updated_at, "
+            "updated_by = excluded.updated_by",
+            (name, str(value), utcnow_iso(), _optional_text(actor)),
+        )
+
+
+def delete_app_setting(key: str) -> bool:
+    """Drop one override so the .env value takes over again."""
+    with get_conn(write=True) as conn:
+        cursor = conn.execute("DELETE FROM app_settings WHERE key = ?", (_text(key),))
+        return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Feature flags (contract 2, section 6.6)
+#
+# A switchable key uses the enabled column. A key that carries text, such as
+# the maintenance message or the minimum mobile version, uses the value column
+# and leaves enabled at its default. app.deps reads the maintenance rows with
+# exactly this convention.
+# ---------------------------------------------------------------------------
+
+
+def all_feature_flags() -> dict[str, dict[str, Any]]:
+    """Every flag row keyed by flag name."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT key, enabled, value, updated_at, updated_by FROM feature_flags"
+        ).fetchall()
+    return {
+        str(row["key"]): {
+            "key": str(row["key"]),
+            "enabled": bool(row["enabled"]),
+            "value": row["value"],
+            "updated_at": row["updated_at"],
+            "updated_by": row["updated_by"],
+        }
+        for row in rows
+    }
+
+
+def get_feature_flag(key: str) -> dict[str, Any] | None:
+    """One flag row, or None when it has never been written."""
+    return all_feature_flags().get(_text(key))
+
+
+def set_feature_flag(
+    key: str,
+    enabled: bool | None = None,
+    value: str | None = None,
+    actor: str | None = None,
+) -> None:
+    """Write one flag. Passing only one of enabled or value leaves the other."""
+    name = _text(key)
+    if not name:
+        raise ValueError("a feature flag needs a key")
+    with get_conn(write=True) as conn:
+        row = conn.execute(
+            "SELECT enabled, value FROM feature_flags WHERE key = ?", (name,)
+        ).fetchone()
+        current_enabled = bool(row["enabled"]) if row is not None else True
+        current_value = row["value"] if row is not None else None
+        conn.execute(
+            "INSERT INTO feature_flags (key, enabled, value, updated_at, updated_by) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
+            "enabled = excluded.enabled, value = excluded.value, "
+            "updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+            (
+                name,
+                1 if (current_enabled if enabled is None else enabled) else 0,
+                current_value if value is None else _optional_text(value),
+                utcnow_iso(),
+                _optional_text(actor),
+            ),
+        )
+
+
+def seed_feature_flags(defaults: Iterable[tuple[str, bool, str | None]]) -> int:
+    """Create any flag row that does not exist yet. Returns how many were added.
+
+    Idempotent, so startup can call it every time. An existing row is never
+    touched, which is what stops a restart from turning a category an admin
+    switched off back on.
+    """
+    added = 0
+    now = utcnow_iso()
+    with get_conn(write=True) as conn:
+        for key, enabled, value in defaults:
+            name = _text(key)
+            if not name:
+                continue
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO feature_flags "
+                "(key, enabled, value, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)",
+                (name, 1 if enabled else 0, _optional_text(value), now, None),
+            )
+            added += int(cursor.rowcount or 0)
+    return added
+
+
+# ---------------------------------------------------------------------------
+# Audit log (contract 2, section 3.8)
+# ---------------------------------------------------------------------------
+
+
+def write_audit(
+    actor: str,
+    action: str,
+    target: str | None = None,
+    detail: Any = None,
+    ip: str | None = None,
+) -> int:
+    """Record one admin mutation. Returns the audit row id, or 0 on failure.
+
+    A dict detail is stored as JSON so a later reader gets structure rather
+    than a repr. Never raises: an audit write that fails must not turn a
+    successful mutation into a 500, it is logged by the caller instead.
+
+    Callers must not pass a password, a token or a signature in detail. The
+    admin routers pass field names and article ids only.
+    """
+    if isinstance(detail, (dict, list, tuple)):
+        try:
+            detail_text: str | None = json.dumps(detail, default=str)
+        except (TypeError, ValueError):
+            detail_text = None
+    else:
+        detail_text = _optional_text(detail)
+    if detail_text and len(detail_text) > MAX_AUDIT_DETAIL_LENGTH:
+        detail_text = detail_text[:MAX_AUDIT_DETAIL_LENGTH]
+    try:
+        with get_conn(write=True) as conn:
+            cursor = conn.execute(
+                "INSERT INTO audit_log (at, actor, action, target, detail, ip) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    utcnow_iso(),
+                    _text(actor, "unknown"),
+                    _text(action, "unknown"),
+                    _optional_text(target),
+                    detail_text,
+                    _optional_text(ip),
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+    except sqlite3.Error:
+        return 0
+
+
+def list_audit(limit: int = DEFAULT_AUDIT_LIMIT) -> list[dict[str, Any]]:
+    """The most recent audit rows, newest first."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, at, actor, action, target, detail, ip FROM audit_log "
+            "ORDER BY id DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [
+        {
+            "id": int(row["id"]),
+            "at": row["at"],
+            "actor": row["actor"],
+            "action": row["action"],
+            "target": row["target"],
+            "detail": row["detail"],
+            "ip": row["ip"],
+        }
+        for row in rows
+    ]
+
+
 __all__ = [
+    "DEFAULT_ADMIN_ARTICLE_LIMIT",
+    "DEFAULT_AUDIT_LIMIT",
     "DEFAULT_BOOKMARK_LIMIT",
     "DEFAULT_DEDUPE_WINDOW_HOURS",
     "DEFAULT_FEED_LIMIT",
@@ -1303,13 +1842,29 @@ __all__ = [
     "DEFAULT_RUNS_LIMIT",
     "DEFAULT_SEARCH_LIMIT",
     "DEFAULT_TRENDING_LIMIT",
+    "MAX_ADMIN_ARTICLE_LIMIT",
     "MAX_FEED_LIMIT",
     "MAX_SEARCH_LIMIT",
     "TRENDING_WINDOW_HOURS",
     "add_bookmark",
+    "admin_get_article",
+    "admin_list_articles",
+    "all_app_settings",
+    "all_feature_flags",
+    "article_siblings",
     "articles_needing_images",
     "bookmarked_ids_for_device",
     "category_counts",
+    "delete_app_setting",
+    "get_app_setting",
+    "get_feature_flag",
+    "list_audit",
+    "mark_moderated",
+    "reset_moderation_cache",
+    "seed_feature_flags",
+    "set_app_setting",
+    "set_feature_flag",
+    "write_audit",
     "count_articles",
     "decode_cursor",
     "delete_article",

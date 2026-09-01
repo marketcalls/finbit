@@ -1,0 +1,38 @@
+{
+  "cli": {
+    "version": ">= 23.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "ios": {
+        "simulator": true
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://replace-with-your-api-host",
+        "EXPO_PUBLIC_APP_KEY": "change-me-mobile"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "android": {
+        "buildType": "app-bundle"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://replace-with-your-api-host",
+        "EXPO_PUBLIC_APP_KEY": "change-me-mobile"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

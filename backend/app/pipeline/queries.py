@@ -10,13 +10,23 @@ Every entry is a plain dict with the keys key, label, prompt and
 category_hint. category_hint is one of the storable category keys from
 app.models.CATEGORY_KEYS and is used only as a fallback when the model returns
 a category outside the fixed vocabulary.
+
+The nine below are the defaults, not the last word. An admin can edit the set
+from the admin screens, which stores it in app_settings under query_set, and
+every lookup here prefers that stored set when it exists. The hardcoded table
+is what a fresh database runs on and what the pipeline falls back to when the
+stored set cannot be read, so ingestion never ends up with no queries because
+of one unreadable row.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 
 from app.models import CATEGORY_KEYS
+
+logger = logging.getLogger(__name__)
 
 QUERIES: list[dict[str, str]] = [
     {
@@ -85,35 +95,77 @@ assert all(q["category_hint"] in CATEGORY_KEYS for q in QUERIES), (
 )
 
 
+def active_queries() -> list[dict[str, str]]:
+    """The query set actually in force, enabled entries only.
+
+    Prefers the admin-edited set stored in app_settings and falls back to the
+    hardcoded table above. settings_bridge is imported here rather than at
+    module scope because it reads this module back for its own defaults, and a
+    lazy import is what keeps that pair from becoming a cycle.
+
+    Returns an empty list only when an admin has switched every query off,
+    which is a deliberate state: a cycle then runs nothing instead of quietly
+    spending money on nine queries nobody asked for.
+    """
+    try:
+        from app.pipeline import settings_bridge
+
+        return [
+            {
+                "key": entry["key"],
+                "label": entry.get("label", entry["key"]),
+                "prompt": entry.get("prompt", ""),
+                "category_hint": entry.get("category_hint") or "",
+            }
+            for entry in settings_bridge.query_definitions()
+            if entry.get("enabled", True)
+        ]
+    except Exception:  # noqa: BLE001 - an unreadable override falls back
+        logger.warning(
+            "the stored query set could not be read, using the built-in queries"
+        )
+        return list(QUERIES)
+
+
 def query_keys() -> tuple[str, ...]:
-    """All nine query keys, in rotation order."""
-    return QUERY_KEYS
+    """The keys of every active query, in rotation order."""
+    return tuple(query["key"] for query in active_queries())
 
 
 def get_query(key: str) -> dict[str, str] | None:
-    """One query definition by key, or None when the key is unknown."""
+    """One active query definition by key, or None when the key is unknown.
+
+    A query an admin has switched off reads as unknown here, so naming it
+    explicitly in an ingest trigger does not run it.
+    """
     if not key:
         return None
-    return _BY_KEY.get(str(key).strip().lower())
+    wanted = str(key).strip().lower()
+    for query in active_queries():
+        if query["key"] == wanted:
+            return query
+    return None
 
 
 def resolve_queries(keys: Iterable[str] | None) -> list[dict[str, str]]:
     """Turn a list of keys into query definitions, dropping unknown keys.
 
-    Passing None or an empty iterable returns the whole set, in rotation order.
-    Duplicates collapse and the caller's order is preserved.
+    Passing None or an empty iterable returns the whole active set, in
+    rotation order. Duplicates collapse and the caller's order is preserved.
     """
+    active = active_queries()
     if keys is None:
-        return list(QUERIES)
+        return active
+    by_key = {query["key"]: query for query in active}
     resolved: list[dict[str, str]] = []
     seen: set[str] = set()
     for raw in keys:
-        query = get_query(str(raw))
+        query = by_key.get(str(raw).strip().lower())
         if query is None or query["key"] in seen:
             continue
         seen.add(query["key"])
         resolved.append(query)
-    return resolved or list(QUERIES)
+    return resolved or active
 
 
 def rotate_keys(cycle: int, count: int) -> list[str]:
@@ -121,22 +173,28 @@ def rotate_keys(cycle: int, count: int) -> list[str]:
 
     Cycle 0 with count 4 yields the first four keys, cycle 1 the next four,
     cycle 2 the last key plus the first three, and so on. `count` is clamped to
-    the size of the query set so a key is never repeated inside one cycle.
+    the size of the active query set so a key is never repeated inside one
+    cycle.
     """
-    total = len(QUERY_KEYS)
+    keys = query_keys()
+    total = len(keys)
+    if not total:
+        return []
     size = max(1, min(int(count), total))
     start = (int(cycle) * size) % total
-    return [QUERY_KEYS[(start + offset) % total] for offset in range(size)]
+    return [keys[(start + offset) % total] for offset in range(size)]
 
 
 def select_queries(cycle: int, count: int) -> list[dict[str, str]]:
     """The query definitions for one scheduler cycle."""
-    return [_BY_KEY[key] for key in rotate_keys(cycle, count)]
+    by_key = {query["key"]: query for query in active_queries()}
+    return [by_key[key] for key in rotate_keys(cycle, count) if key in by_key]
 
 
 __all__ = [
     "QUERIES",
     "QUERY_KEYS",
+    "active_queries",
     "get_query",
     "query_keys",
     "resolve_queries",

@@ -4,6 +4,12 @@ Contract section 5:
   GET /api/feed            cursor paginated ArticleCard list
   GET /api/articles/{id}   one ArticleCard, 404 when the id is unknown
 
+Phase 2 adds two things and changes nothing else. Both routes now require an
+authenticated device (CONTRACT_MOBILE_ADMIN.md section 6), so the device id
+behind the bookmarked flag is one the server issued rather than a header the
+caller picked, and both sit behind the maintenance gate. The response bodies
+are byte for byte what phase 1 returned.
+
 All data access goes through app.repo. There is no SQL in this module.
 """
 
@@ -13,11 +19,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Path, Query, status
 
-from app import repo
+from app import deps, repo
 from app.models import ArticleCard, FeedResponse
-from app.routers import DeviceId
 
-router = APIRouter(prefix="/api", tags=["feed"])
+router = APIRouter(prefix="/api", tags=["feed"], dependencies=[deps.MaintenanceGate])
 
 ARTICLE_NOT_FOUND = "Article not found"
 
@@ -30,7 +35,7 @@ _CATEGORY_VALUES = "all, india, global, stocks, economy, rbi, sebi, earnings, co
     response_description="One page of article cards plus the cursor for the next page.",
 )
 def get_feed(
-    device_id: DeviceId,
+    device: deps.CurrentDevice,
     category: Annotated[
         str,
         Query(description=f"Category filter. One of: {_CATEGORY_VALUES}."),
@@ -56,8 +61,9 @@ def get_feed(
 
     An unknown category, an unknown sort mode and an unparsable cursor are all
     treated as absent by the repository, so a stale client never gets a 500.
-    The per-article bookmarked flag is resolved for the calling device in one
-    batched query inside repo.list_feed.
+    The per-article bookmarked flag is resolved for the authenticated device in
+    one batched query inside repo.list_feed. Hidden articles are filtered out
+    there and pinned ones lead the page.
     """
     page = repo.list_feed(
         category=category,
@@ -65,7 +71,7 @@ def get_feed(
         sort=sort,
         cursor=cursor,
         limit=limit,
-        device_id=device_id,
+        device_id=device.id,
     )
     return FeedResponse.model_validate(page)
 
@@ -76,11 +82,15 @@ def get_feed(
     responses={status.HTTP_404_NOT_FOUND: {"description": ARTICLE_NOT_FOUND}},
 )
 def get_article(
-    device_id: DeviceId,
+    device: deps.CurrentDevice,
     article_id: Annotated[int, Path(ge=1, description="Article id.")],
 ) -> ArticleCard:
-    """Return a single article, or 404 when the id does not exist."""
-    article = repo.get_article(article_id, device_id=device_id)
+    """Return a single article, or 404 when the id does not exist.
+
+    An article an admin has hidden reads as missing here too, so moderating a
+    story also closes the deep link to it.
+    """
+    article = repo.get_article(article_id, device_id=device.id)
     if article is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=ARTICLE_NOT_FOUND

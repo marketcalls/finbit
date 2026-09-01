@@ -91,3 +91,84 @@ CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
   headline, summary, why_it_matters, symbols_text, topics_text,
   content='', tokenize='porter unicode61'
 );
+
+-- ---------------------------------------------------------------------------
+-- Phase 2 additions (CONTRACT_MOBILE_ADMIN.md section 4).
+--
+-- The ALTER TABLE additions to articles and the idx_articles_visible index are
+-- not here on purpose: ALTER TABLE has no IF NOT EXISTS form and this file is
+-- executed on every start. app/migrate.py reads PRAGMA table_info(articles)
+-- and applies them only when they are missing.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS devices (
+  id            TEXT PRIMARY KEY,
+  platform      TEXT NOT NULL,
+  app_id        TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  last_seen_at  TEXT,
+  revoked       INTEGER NOT NULL DEFAULT 0,
+  revoked_at    TEXT,
+  request_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_devices_seen ON devices(last_seen_at DESC);
+
+CREATE TABLE IF NOT EXISTS nonces (
+  nonce     TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  seen_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nonces_seen ON nonces(seen_at);
+
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+  token_hash  TEXT PRIMARY KEY,
+  subject     TEXT NOT NULL,
+  kind        TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  used_at     TEXT,
+  revoked     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_refresh_subject ON refresh_tokens(subject, kind);
+
+CREATE TABLE IF NOT EXISTS admin_users (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  username      TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  last_login_at TEXT,
+  failed_count  INTEGER NOT NULL DEFAULT 0,
+  locked_until  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  updated_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS feature_flags (
+  key        TEXT PRIMARY KEY,
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  value      TEXT,
+  updated_at TEXT NOT NULL,
+  updated_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  at     TEXT NOT NULL,
+  actor  TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT,
+  detail TEXT,
+  ip     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at DESC);
+
+CREATE TABLE IF NOT EXISTS rate_buckets (
+  key        TEXT PRIMARY KEY,
+  tokens     REAL NOT NULL,
+  updated_at TEXT NOT NULL
+);

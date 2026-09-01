@@ -14,6 +14,13 @@
     "noEmit": true,
     "skipLibCheck": true,
 
+    // packages/shared ships TypeScript source with no build step, so the
+    // package name resolves straight to its entry file and vite.config.ts
+    // carries the matching alias. Relative to this file: there is no baseUrl.
+    "paths": {
+      "@finbit/shared": ["../packages/shared/src/index.ts"]
+    },
+
     "strict": true,
     "noImplicitOverride": true,
     "noUnusedLocals": true,

@@ -6,6 +6,16 @@ Contract section 5:
   POST /api/admin/ingest   dev trigger, starts one pipeline cycle in background
   GET  /api/admin/runs     the last 20 ingest runs, newest first
 
+Phase 2 puts /api/categories behind an authenticated device and the maintenance
+gate, exactly like the feed. /api/health stays public and ungated on purpose: a
+monitor has no device credentials, and a health check that needs authentication
+cannot tell you the service is down. It reports counts and status only, never a
+secret and never anything about a caller.
+
+The phase 1 dev admin routes below keep their shape and their gates so nothing
+already built breaks (CONTRACT_MOBILE_ADMIN.md section 6.4). The authenticated
+admin equivalents live in app/routers/admin_pipeline.py.
+
 All data access goes through app.repo. There is no SQL in this module. The
 ingestion pipeline is imported lazily inside the background job so the API
 still imports and serves cached articles when the pipeline is unavailable or
@@ -22,7 +32,7 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 
-from app import repo
+from app import deps, repo
 from app.config import get_settings
 from app.models import (
     CategoriesResponse,
@@ -114,9 +124,14 @@ def health() -> HealthResponse:
     "/categories",
     summary="Categories and market filters",
     response_description="Category keys with counts, plus the market quick filter chips.",
+    dependencies=[deps.MaintenanceGate],
 )
-def categories() -> CategoriesResponse:
-    """Return the category tabs with live counts and the market filter chips."""
+def categories(device: deps.CurrentDevice) -> CategoriesResponse:
+    """Return the category tabs with live counts and the market filter chips.
+
+    Hidden articles are left out of the counts, so a tab never advertises
+    stories the feed will not show.
+    """
     return CategoriesResponse(
         categories=repo.category_counts(),
         market_filters=repo.market_filters(),

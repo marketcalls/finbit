@@ -11,6 +11,8 @@ dependencies = [
     "pydantic-settings",
     "apscheduler",
     "python-dotenv",
+    "pyjwt",
+    "argon2-cffi",
 ]
 
 [dependency-groups]

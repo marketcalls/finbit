@@ -165,3 +165,81 @@
     scroll-behavior: auto !important;
   }
 }
+
+/* ------------------------------------------------------------------------- */
+/* shadcn/ui compatibility layer, contract section 9.                         */
+/*                                                                            */
+/* shadcn primitives are written against their own token vocabulary           */
+/* (--background, --primary, --ring and so on). Rather than fork every         */
+/* component or ship a second palette, the shadcn names are declared here as  */
+/* aliases of the FinBit tokens above. Nothing above this line changes: a      */
+/* stock shadcn component simply resolves to the FinBit colours.              */
+/*                                                                            */
+/* The aliases are declared once on :root and never repeated per theme,        */
+/* because each one points at a FinBit variable rather than a literal. Both   */
+/* :root and [data-theme='light'] set their variables on the same element     */
+/* (html), so var(--card) inside an alias resolves to whichever value the      */
+/* active theme block put there. One declaration therefore covers both        */
+/* themes, and a future token edit above cannot leave the aliases stale.      */
+/* ------------------------------------------------------------------------- */
+
+@import 'tw-animate-css';
+
+:root {
+  /* Direct aliases: the FinBit token already carries the same meaning. */
+  --background: var(--bg);
+  --foreground: var(--fg);
+  --card-foreground: var(--fg);
+  --primary: var(--accent);
+  --primary-foreground: var(--on-accent);
+  --secondary: var(--muted);
+  --secondary-foreground: var(--fg);
+  --muted-foreground: var(--muted-fg);
+  --accent-foreground: var(--on-accent);
+  --destructive: var(--breaking);
+
+  /*
+    The four shadcn concepts FinBit has no token for, each derived from one it
+    does have, so they keep tracking the palette:
+      popover      surfaces that float over the page, same paper as a card
+      input        the resting border of a form control
+      ring         the focus indicator. Deliberately --fg, not --accent, so it
+                   matches the app-wide :focus-visible outline set above and
+                   keeps contrast against the dark navy background
+      destructive-foreground  text printed on the destructive colour
+  */
+  --popover: var(--card);
+  --popover-foreground: var(--fg);
+  --input: var(--border);
+  --ring: var(--fg);
+  --destructive-foreground: var(--on-breaking);
+}
+
+/*
+  Expose the aliases as Tailwind colour utilities (bg-background, text-primary,
+  border-input, ring-ring and the rest) so shadcn class strings resolve without
+  edits. Only names FinBit does not already publish appear here: --color-card,
+  --color-muted, --color-border and --color-accent are defined in the @theme
+  block above and keep their FinBit meaning. Note that shadcn uses "accent" for
+  a subtle hover surface while FinBit uses it for the brand blue; the primitives
+  in src/components/ui therefore hover on bg-muted, and a pasted-in component
+  that hovers on bg-accent still reads because --accent-foreground is on-accent.
+  No radius or font token is redefined here, so existing screens are untouched.
+*/
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+}
