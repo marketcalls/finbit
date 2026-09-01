@@ -81,6 +81,35 @@ export const LONG_TIMEOUT_MS = 120000;
 export const COST_PER_QUERY_USD = 0.006;
 
 // ---------------------------------------------------------------------------
+// One-time registration routes
+// ---------------------------------------------------------------------------
+
+/**
+ * The three routes from CONTRACT_ADMIN_REGISTRATION.md sections 3.1 to 3.3.
+ *
+ * They are spelled out here rather than added to the shared ENDPOINTS object
+ * because only the admin console can ever call them. The mobile app has no
+ * login and the public web shell registers nothing, so a shared constant would
+ * be an export with exactly one importer. If a second client ever needs them,
+ * they move to packages/shared and these three lines go away.
+ */
+const ADMIN_AUTH_STATUS = '/api/admin/auth/status';
+const ADMIN_AUTH_REGISTER = '/api/admin/auth/register';
+const ADMIN_AUTH_CHANGE_PASSWORD = '/api/admin/auth/change-password';
+
+/** GET /api/admin/auth/status, contract section 3.1. */
+export interface AdminAuthStatus {
+  /**
+   * True only while no admin account exists.
+   *
+   * It carries nothing else on purpose: no username, no hint about whether a
+   * bootstrap token is currently valid. The login screen uses it to pick a
+   * form and must not try to read more into it than that.
+   */
+  registration_open: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -131,6 +160,28 @@ export class AdminApiError extends Error {
   /** True when a rate limit bucket is empty, contract section 3.7. */
   get isRateLimited(): boolean {
     return this.status === 429 || this.code === 'rate_limited';
+  }
+
+  /**
+   * True when the route answered 404.
+   *
+   * On register this is not a missing endpoint. Registration closes itself with
+   * a 404 the moment an admin exists (registration contract section 3.2), so a
+   * reachable instance never confirms that the route was ever there. The caller
+   * reads it as "an admin account already exists", not as a broken deployment.
+   */
+  get isNotFound(): boolean {
+    return this.status === 404;
+  }
+
+  /** True when the API refused a new password against its policy, section 3.2. */
+  get isWeakPassword(): boolean {
+    return this.code === 'weak_password' || this.status === 422;
+  }
+
+  /** True when the bootstrap token was wrong or had expired, section 3.2. */
+  get isInvalidBootstrapToken(): boolean {
+    return this.code === 'invalid_bootstrap_token';
   }
 
   /** True when the API is in maintenance mode, contract section 6.2. */
@@ -410,6 +461,29 @@ async function authorized<T>(method: string, path: string, options: SendOptions 
   }
 }
 
+/**
+ * One authenticated call whose 401 means the body was wrong, not the session.
+ *
+ * change-password is the one admin route where a 401 is ambiguous: it can mean
+ * the access token expired, or it can mean the current password the operator
+ * typed did not match. authorized() reads every 401 as the first case and, on a
+ * second one, ends the session, which would sign an admin out for mistyping
+ * their own password.
+ *
+ * Refreshing first removes the ambiguity. The access token is then minutes old,
+ * so any 401 that follows is about the request body, and the retry that would
+ * have dropped the session never happens. It costs one extra round trip on an
+ * action performed once in the life of a deployment.
+ */
+async function authorizedFreshToken<T>(
+  method: string,
+  path: string,
+  options: SendOptions = {},
+): Promise<T> {
+  await refreshSession();
+  return send<T>(method, path, { ...options, token: accessToken });
+}
+
 // ---------------------------------------------------------------------------
 // Public surface
 // ---------------------------------------------------------------------------
@@ -433,6 +507,59 @@ export function hasStoredSession(): boolean {
 }
 
 export const adminApi = {
+  // -- registration, registration contract sections 3.1 to 3.3 -------------
+
+  /**
+   * Ask whether this deployment still needs its one admin account.
+   *
+   * Public and unauthenticated, so it is sent with send() rather than
+   * authorized(): calling it must never trigger a refresh, because the login
+   * screen asks it before anyone is signed in.
+   */
+  authStatus(signal?: AbortSignal): Promise<AdminAuthStatus> {
+    return send<AdminAuthStatus>('GET', ADMIN_AUTH_STATUS, { signal });
+  },
+
+  /**
+   * Create the one admin account and sign in with it.
+   *
+   * The response already carries a session, so this adopts the tokens exactly
+   * as login() does and the browser goes straight to the dashboard. Throws
+   * AdminApiError: a 404 means an admin already exists and registration is
+   * closed for good, which is a normal answer here rather than a fault.
+   */
+  async register(username: string, password: string, bootstrapToken: string): Promise<string> {
+    const tokens = await send<AdminTokenResponse>('POST', ADMIN_AUTH_REGISTER, {
+      body: { username, password, bootstrap_token: bootstrapToken },
+    });
+    adoptTokens(tokens);
+    return tokens.username;
+  },
+
+  /**
+   * Change the admin password. Resolves on 204, throws AdminApiError otherwise.
+   *
+   * The server revokes every admin refresh token as part of this, so the caller
+   * must treat a success as the end of this tab's session too.
+   */
+  changePassword(currentPassword: string, newPassword: string): Promise<void> {
+    return authorizedFreshToken<void>('POST', ADMIN_AUTH_CHANGE_PASSWORD, {
+      body: { current_password: currentPassword, new_password: newPassword },
+    });
+  },
+
+  /**
+   * Forget this tab's session without calling the API.
+   *
+   * For the one case where the server has already revoked it: a successful
+   * change-password kills every admin refresh token, so POSTing this tab's
+   * token to logout would only ask the API to revoke what it just revoked, and
+   * would answer 401 while doing it.
+   */
+  endSession(): void {
+    dropSession();
+  },
+
   // -- auth, section 6.3 ---------------------------------------------------
 
   /** Sign in. Throws AdminApiError on a wrong password, a lockout or a limit. */

@@ -13,7 +13,9 @@ accident (CONTRACT_MOBILE_ADMIN.md sections 3.9 and 6):
    deployment is missing a secret, before anything is served,
 3. seed the feature flag defaults, so /api/config answers on a fresh database,
 4. create the bootstrap admin when one is configured,
-5. start the scheduler and the conditional startup ingest.
+5. mint and print the one-time registration token, but only if step 4 left the
+   admin table empty (CONTRACT_ADMIN_REGISTRATION.md section 2),
+6. start the scheduler and the conditional startup ingest.
 
 Steps 1 to 3 are safe on a machine with no PERPLEXITY_API_KEY: config never
 raises on a missing key, and the scheduler is imported lazily so a pipeline
@@ -51,7 +53,8 @@ from app.routers import (
     meta,
     search,
 )
-from app.security.middleware import install_security
+from app.security import bootstrap
+from app.security.middleware import coded_http_exception_handler, install_security
 
 API_TITLE = "FinBit API"
 API_VERSION = __version__
@@ -70,6 +73,19 @@ _SCHEDULER_START_NAMES = ("start_scheduler", "start")
 _SCHEDULER_STOP_NAMES = ("stop_scheduler", "shutdown_scheduler", "shutdown", "stop")
 
 INTERNAL_ERROR_DETAIL = "Internal server error"
+
+# The body a path that does not exist answers with. Starlette's default is
+# {"detail": "Not Found"} with no code, which would leave the closed
+# registration route (CONTRACT_ADMIN_REGISTRATION.md section 3.2) tellable
+# apart from an unknown path by its body alone. Giving both the same body is
+# what keeps a route that closed indistinguishable from one never mounted.
+NOT_FOUND_CODE = "not_found"
+NOT_FOUND_DETAIL = "Not found"
+
+# Starlette raises HTTPException(404) with no detail for an unrouted path, and
+# the constructor fills it in with this phrase. A 404 carrying anything else
+# was raised by a route about a row it could not find, so it keeps its body.
+UNROUTED_DETAIL = "Not Found"
 
 SECURITY_REFUSED_MESSAGE = (
     "FinBit refused to start because the security configuration is incomplete. "
@@ -318,6 +334,36 @@ def bootstrap_admin() -> str | None:
         return None
 
 
+def issue_bootstrap_token(application: FastAPI) -> bootstrap.BootstrapToken | None:
+    """Mint and print the one-time registration token, if there is no admin yet.
+
+    Section 2 of CONTRACT_ADMIN_REGISTRATION.md. The token lives on app.state
+    and nowhere else: never in the database, never in a file, never in a
+    response body. It is generated only while admin_users is empty, so a
+    deployment that already has its account prints nothing and mints nothing,
+    and the router drops it the moment the account is created.
+
+    The console is the only place it appears, which is the point. It is the one
+    thing standing between a reachable port and someone else claiming the
+    instance, so whoever can read the server log is whoever can claim it.
+
+    Under uvicorn --reload this reprints on every code change while no admin
+    exists. That is expected rather than a leak: each restart mints a fresh
+    token and the previous one dies with the process.
+    """
+    bootstrap.store(application.state, None)
+    try:
+        if repo.admin_account_count() > 0:
+            return None
+    except sqlite3.Error:
+        logger.exception("the admin table could not be read")
+        return None
+    token = bootstrap.issue()
+    bootstrap.store(application.state, token)
+    logger.info("\n%s", bootstrap.banner(token))
+    return token
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Bring the application up in the order section 3.9 requires.
@@ -336,6 +382,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     enforce_security_configuration()
     seed_feature_flags()
     bootstrap_admin()
+    issue_bootstrap_token(app)
     started = await _start_scheduler()
     seed_task = _schedule_startup_ingest()
     try:
@@ -369,6 +416,28 @@ _settings = get_settings()
 # 413 that cap answers with still carries the CORS headers a browser needs to
 # read it.
 install_security(app)
+
+
+async def not_found_handler(request: Request, exc: Exception) -> Response:
+    """Answer an unrouted path with the {"detail", "code"} body of section 3.2.
+
+    Registered for the status code rather than the exception class, so it sees
+    every 404 and hands the ones a route raised about its own missing row
+    straight back to the handler install_security registered. Only the bare
+    404 Starlette raises for a path with no route is reshaped, which is exactly
+    the body the closed registration route has to be indistinguishable from.
+    """
+    code = getattr(exc, "code", None)
+    detail = getattr(exc, "detail", None)
+    if not code and (detail is None or str(detail) == UNROUTED_DETAIL):
+        return JSONResponse(
+            status_code=404,
+            content={"detail": NOT_FOUND_DETAIL, "code": NOT_FOUND_CODE},
+        )
+    return await coded_http_exception_handler(request, exc)
+
+
+app.add_exception_handler(404, not_found_handler)
 
 # Strict CORS (contract 2, section 3.2). The origin list is explicit and never
 # "*", and allow_credentials stays false because this API authenticates with a
@@ -466,12 +535,17 @@ __all__ = [
     "API_VERSION",
     "CORS_HEADERS",
     "CORS_METHODS",
+    "NOT_FOUND_CODE",
+    "NOT_FOUND_DETAIL",
     "SECURITY_REFUSED_MESSAGE",
+    "UNROUTED_DETAIL",
     "app",
     "bootstrap_admin",
     "enforce_security_configuration",
     "include_optional_routers",
+    "issue_bootstrap_token",
     "lifespan",
+    "not_found_handler",
     "root",
     "seed_feature_flags",
 ]

@@ -587,8 +587,55 @@ class AdminFlagsUpdate(BaseModel):
     min_mobile_version: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# One-time admin registration (CONTRACT_ADMIN_REGISTRATION.md section 3).
+# ---------------------------------------------------------------------------
+
+ADMIN_USERNAME_MIN_LENGTH = 3
+ADMIN_USERNAME_MAX_LENGTH = 32
+ADMIN_USERNAME_PATTERN = r"^[A-Za-z0-9._-]+$"
+"""The username rules of section 3.2.
+
+The registration route checks them itself rather than through Field(pattern=...)
+so a bad name comes back with the {"detail", "code"} body every other failure
+uses, instead of pydantic's validation list.
+"""
+
+
+class AdminRegistrationStatus(BaseModel):
+    """GET /api/admin/auth/status.
+
+    One boolean and nothing else, deliberately. Any second field here would be
+    a hint about an instance nobody has claimed yet.
+    """
+
+    registration_open: bool
+
+
+class AdminRegisterRequest(BaseModel):
+    """POST /api/admin/auth/register body. Never log any of the three fields."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    username: str
+    password: str
+    bootstrap_token: str
+
+
+class AdminPasswordChangeRequest(BaseModel):
+    """POST /api/admin/auth/change-password body. Never log either field."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    current_password: str
+    new_password: str
+
+
 __all__ = [
     "ADMIN_ARTICLE_SORTS",
+    "ADMIN_USERNAME_MAX_LENGTH",
+    "ADMIN_USERNAME_MIN_LENGTH",
+    "ADMIN_USERNAME_PATTERN",
     "AdminArticle",
     "AdminArticleList",
     "AdminArticlePatch",
@@ -596,6 +643,9 @@ __all__ = [
     "AdminFlagsUpdate",
     "AdminLoginRequest",
     "AdminMeResponse",
+    "AdminPasswordChangeRequest",
+    "AdminRegisterRequest",
+    "AdminRegistrationStatus",
     "AdminTokenResponse",
     "AppId",
     "ArticleClusterResponse",

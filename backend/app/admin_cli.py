@@ -4,10 +4,15 @@
     uv run python -m app.admin_cli list-admins
     uv run python -m app.admin_cli reset-password --username alice
 
-There is no HTTP route that creates the first admin, on purpose: an endpoint
-that can mint an administrator is an endpoint someone can find. The password is
-read twice through getpass, so it is never echoed, never sits in shell history
-and never reaches a log line. Only the username is ever printed.
+Exactly one admin account exists for the life of a deployment
+(CONTRACT_ADMIN_REGISTRATION.md section 1), so create-admin refuses once there
+is one and points at reset-password instead. reset-password is the recovery
+path when that account's password is lost: it needs a shell on the host, which
+is a deliberately higher bar than any HTTP route could offer.
+
+The password is read twice through getpass, so it is never echoed, never sits
+in shell history and never reaches a log line. Only the username is ever
+printed.
 """
 
 from __future__ import annotations
@@ -29,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 PROMPT_FIRST = "New password: "
 PROMPT_SECOND = "Repeat password: "
+
+# Section 3.4. One account, for the life of the deployment: a second one would
+# be a second thing to revoke and a second thing to forget about.
+ADMIN_EXISTS_MESSAGE = "An admin account already exists. Use reset-password instead."
 
 
 @dataclass(frozen=True)
@@ -174,8 +183,10 @@ def _cmd_create_admin(args: argparse.Namespace) -> int:
     if not name:
         print("a username is required", file=sys.stderr)
         return 2
-    if admin_exists(name):
-        print(f"the username {name} already exists", file=sys.stderr)
+    if admin_count() > 0:
+        # Checked before the name, so the answer is the same whichever name was
+        # asked for: there is one account, and this is not the way to reach it.
+        print(ADMIN_EXISTS_MESSAGE, file=sys.stderr)
         return 1
     try:
         password = _read_new_password()
@@ -258,6 +269,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "ADMIN_EXISTS_MESSAGE",
     "AdminRow",
     "admin_count",
     "admin_exists",

@@ -25,6 +25,8 @@ caller is the FinBit app.
 | An anonymous caller reaching the admin console | Every admin route requires a bearer token in the `admin` JWT audience. A device token on an admin route is refused |
 | Brute forcing an admin password | argon2id hashing, a 12 character minimum, lockout after 5 consecutive failures for 15 minutes, and 10 login attempts per IP per 15 minutes |
 | Learning whether a username exists | A wrong username and a wrong password return a byte identical body, and the unknown-username path burns one argon2 verification so the two take comparable time |
+| A stranger claiming an unclaimed instance | Registration needs a 144 bit token that exists only in the server process and only for 30 minutes, and it closes permanently the moment one account exists. See section 8, and the warning in it |
+| Finding the registration route after it closed | It answers 404 with the byte identical body of a path that was never mounted, so it cannot be told apart from one |
 | A rogue browser origin calling the API | An explicit CORS allowlist, never a wildcard, with `allow_credentials` off |
 | A request designed to make the server do work | A 256 KB body cap, refused from the `Content-Length` header before a byte is read |
 | Silent misconfiguration | Startup refuses to run when any of the four secrets is empty or still holds its `change-me` placeholder |
@@ -40,6 +42,9 @@ caller is the FinBit app.
 - **Anyone who can run the registration handshake.** `POST /api/auth/device` is
   open to anything holding a valid app key. It is rate limited to 5 devices per
   IP per hour, which slows a farm down; it does not stop one.
+- **Anyone who can read the server console before the admin account exists.**
+  The bootstrap token is printed there, and printing it is the whole mechanism.
+  Section 8 says what follows from that.
 - **Traffic interception without TLS.** Every control here assumes HTTPS.
   Over plain HTTP, the registration response hands the device secret to anyone
   on the path, and everything downstream falls with it.
@@ -119,9 +124,10 @@ cross-origin request to gain.
 
 **7. Admin login.** argon2id password hashing, account lockout, a separate JWT
 audience so a device token can never reach an admin route, and an `audit_log`
-row for every mutation.
+row for every mutation. There is one account, created once through the
+registration route in section 8 and never again.
 *Stops:* unauthenticated access to the pipeline and moderation controls, and
-makes every change attributable.
+makes every change attributable to that account.
 
 Two more protections sit underneath all seven, in
 `backend/app/security/middleware.py`:
@@ -300,6 +306,11 @@ Other codes the API returns:
 | Status | `code` | When |
 | --- | --- | --- |
 | 401 | `invalid_refresh_token` | Any refresh failure: unknown, expired, revoked, or already used. One code for all of them, because a distinct code per cause would tell an attacker whether a guessed token ever existed |
+| 401 | `invalid_credentials` | Any admin sign-in failure, and a wrong current password on `POST /api/admin/auth/change-password`. One body for all of them |
+| 401 | `invalid_bootstrap_token` | Registration was presented with a wrong token, an expired one, or none. One code for all three |
+| 404 | `not_found` | A path with no route, and `POST /api/admin/auth/register` once the admin account exists. The same body for both, on purpose |
+| 422 | `invalid_username` | The registration username is outside 3 to 32 characters of `[A-Za-z0-9._-]` |
+| 422 | `weak_password` | A new password broke one of the five policy rules. The detail names the rule, because it is the caller's own password |
 | 413 | `payload_too_large` | The request body is over 256 KB |
 | 503 | `maintenance` | Maintenance mode is on. Every content route answers this; `/api/config` and the admin routes keep working |
 
@@ -368,10 +379,16 @@ the FastAPI threadpool and the scheduler threads.
 | `device` | 120 | 120 per minute, per device | Every device-authenticated route |
 | `ip` | 600 | 600 per minute, per IP | Every device route, every admin route, both auth routes |
 | `admin_login` | 10 | 10 per 15 minutes, per IP | `POST /api/admin/auth/login` |
+| `admin_register` | 5 | 5 per hour, per IP | `POST /api/admin/auth/register`, while it is open |
+| `admin_auth_status` | 30 | 30 per minute, per IP | `GET /api/admin/auth/status` |
 | `admin_ingest` | 6 | 6 per hour, per IP | `POST /api/admin/pipeline/ingest` |
 
 A refusal is 429 with `code: rate_limited` and a `Retry-After` header in whole
 seconds.
+
+`admin_register` and the shared `ip` budget are spent inside the registration
+handler rather than in a dependency, and only after it has confirmed the route
+is still open. Section 8 explains why, and what that costs.
 
 **The IP is the socket address and never `X-Forwarded-For`.** With no trusted
 proxy configured, honouring that header would let any caller pick its own rate
@@ -394,10 +411,13 @@ refused, with the same body as a wrong one.
 | `DEVICE_MASTER_KEY` | The repo root `.env`, git-ignored | Deriving every device secret |
 | `JWT_SECRET` | The same | Signing and verifying access tokens |
 | `PERPLEXITY_API_KEY` | The same | The news pipeline. Never sent to any client |
-| `ADMIN_BOOTSTRAP_PASSWORD` | The same, optional | Creating the first admin at startup. Clear it once the account exists |
+| `ADMIN_BOOTSTRAP_PASSWORD` | The same, optional | Creating the one admin at startup. Clear it once the account exists |
+| The bootstrap token | The API process memory only, on `app.state` | Creating the one admin account through the browser, once. Section 8 |
 
-None of these ever reaches a client, a response body or a log line. The startup
-validation messages name the missing variable and never quote its value.
+None of these ever reaches a client or a response body, and none of them appears
+in a log line, with one deliberate exception: the bootstrap token is printed to
+the console at startup, because that print is the entire delivery mechanism. The
+startup validation messages name the missing variable and never quote its value.
 
 ### Public by definition
 
@@ -445,7 +465,168 @@ instead.
 
 ---
 
-## 8. Key rotation
+## 8. The one admin account and its bootstrap token
+
+### One account, for the life of the deployment
+
+FinBit has exactly one admin account. There is no invite flow, no second admin,
+no pending queue, no roles and no user management screen. Everyone who needs the
+console shares it, and a forgotten password is recovered from a shell on the
+host with `uv run python -m app.admin_cli reset-password`.
+
+That is a trade-off, and it is worth stating rather than selling. There is no
+per-person attribution: every `audit_log` row carries the same one name.
+Removing one person's access means changing the password for everyone. What it
+buys is an attack surface one account wide, exactly one route that can ever
+create an administrator, and that route existing only until it is used once.
+
+### How the account is created
+
+While `admin_users` is empty, startup mints a token with
+`secrets.token_urlsafe(18)`, which is 144 bits of entropy, and prints it to the
+console the API is running in:
+
+```
+============================================================
+  FinBit: no admin account exists.
+  Open the web app at /#/admin and create it.
+  Bootstrap token: rygW1T-QUTug9-sRtzQ0-5azYls
+  Valid for 30 minutes. Printed once per start.
+============================================================
+```
+
+The dashes carry no meaning. Dashes and whitespace are stripped from both sides
+before the comparison, which then runs through `hmac.compare_digest` on the
+normalized string, so a token typed back with the grouping, without it, or with
+a trailing newline is the same input.
+
+`POST /api/admin/auth/register` takes a username, a password and that token, and
+answers 201 with a signed-in admin session, so the browser goes straight to the
+dashboard rather than through the login form. On success the token is dropped
+from memory before the response is built, so it cannot create a second account
+even inside its 30 minute window.
+
+When `ADMIN_BOOTSTRAP_USERNAME` and `ADMIN_BOOTSTRAP_PASSWORD` are both set,
+startup creates the account itself and no token is minted or printed at all.
+
+### The token is never persisted
+
+It lives on `app.state` and nowhere else. It is never written to the database,
+never written to a file, and never returned by any endpoint, the status route
+included. `backend/app/security/bootstrap.py` touches no database, no filesystem
+and no logger, so there is no code path in it that could put the token anywhere
+it would outlive the process.
+
+What follows from that:
+
+- Restarting the API destroys the token and mints a new one, while no admin
+  exists. Once the account exists, a restart mints nothing and prints nothing.
+- Under `uvicorn --reload` it reprints on every save, because every reload is a
+  new process. Each print is a different secret and the previous one died with
+  the process that printed it. Expected, and called out in the README so it does
+  not read as a bug.
+- It expires 30 minutes after that process started. An expired token, a wrong
+  token and no token at all take the same path, return the same 401
+  `invalid_bootstrap_token` body, and always run the same comparison, so neither
+  the body nor the response time says which of the three it was.
+- Nothing can recover a token that lapsed. Restart the API and use the new one.
+
+### 404, not 403
+
+Once the account exists, the registration route answers **404 `not_found`** with
+the body a path that was never mounted returns. `main.py` reshapes Starlette's
+default `{"detail": "Not Found"}` into the same
+`{"detail": "Not found", "code": "not_found"}` precisely so the two cannot be
+told apart. A 403 would confirm the route is there, and a route that can mint an
+administrator is worth finding.
+
+That equality is also why the two rate limit budgets are spent inside the
+handler rather than in a `Depends`. A dependency runs before the handler, so a
+caller who had drained a bucket would get 429 from the closed route while an
+unknown path still answered 404, and the difference would say the route is real.
+The order is: count the admin rows, answer 404 if there is one, and only then
+charge the buckets. Tests assert the bodies are byte identical to a POST at
+`/api/admin/auth/no-such-route`, both normally and with both buckets drained.
+
+The cost of that choice, on the record: a closed registration route does no rate
+limiting of its own. Hitting it is as cheap as hitting any other unknown path,
+plus one `COUNT(*)` over a table with at most one row.
+
+### Race safety
+
+Two simultaneous registrations cannot both succeed. `repo.create_first_admin`
+opens the write with `BEGIN IMMEDIATE`, re-counts `admin_users` inside that
+transaction, and only then inserts. The count that decides is the one holding
+the write lock; the count the router took a moment earlier is only an early
+exit. `get_conn(write=True)` serializes the threads of one uvicorn worker, and
+`BEGIN IMMEDIATE` serializes separate processes against the same file, so both
+shapes of the race are covered. The `UNIQUE` constraint on `username` is caught
+as a third backstop.
+
+The loser is answered with the same 404 as anyone arriving late, because by then
+it is the same situation, and the browser swaps to the sign-in form with "An
+admin account already exists. Sign in instead."
+
+`backend/tests/test_admin_register.py` drives two real threads through
+`create_first_admin` behind a `threading.Barrier` with two **different**
+usernames, so the `UNIQUE` constraint cannot be what saves it, and asserts one
+winner and exactly one row.
+
+### The two new routes and their budgets
+
+| Route | Auth | Budget |
+| --- | --- | --- |
+| `GET /api/admin/auth/status` | none | 30 per IP per minute (`admin_auth_status`), plus the shared `ip` bucket |
+| `POST /api/admin/auth/register` | the bootstrap token | 5 per IP per hour (`admin_register`), plus the shared `ip` bucket, charged only while the route is open |
+
+`status` returns one boolean and nothing else: no username, no count, and no
+reading of `app.state`, so it cannot hint at whether a token is currently live
+or ever was. It has to be public, because the login screen has to ask which of
+its two faces to render before anyone can sign in.
+
+Inside the open route the checks are ordered so the cheapest refusal comes
+first: the row count, then the budgets, then the token, then the username, then
+the password policy. Someone without the token never reaches the cost of an
+argon2 hash. Tests pin the last two steps of that order from both sides: a bad
+token beats a bad username and password, and a bad username beats a bad
+password.
+
+### Create the account before you expose the port
+
+> **Create the admin account before the API is reachable from anything but your
+> own machine.** Until it exists, the only thing between a reachable port and
+> someone else owning your console is a token printed on a console you may not
+> be the only one watching. Anyone who can reach the port and read that token
+> owns the instance, and then registration closes against you: your recovery
+> path is a shell on the host.
+
+In practice:
+
+- Start the API on localhost, claim the account, and only then start the dev
+  tunnel or open the forwarded port. This is an order of operations, not a
+  setting.
+- If the API's output is shipped to a log aggregator or a CI transcript, the
+  token is in that pipeline for as long as that line is retained. Claim the
+  account, after which nothing is printed again.
+- Sharing a terminal on a call publishes the token to everyone watching.
+- If you think someone else saw a token and the account does not exist yet,
+  restart the API. The token they saw dies with the process that printed it.
+
+### What this does not protect
+
+- **Nothing binds the token to an origin, an IP or a session.** Anyone holding
+  the string can register from anywhere the port is reachable.
+- **`POST /api/admin/auth/change-password` has no rate limit of its own and does
+  not touch the lockout counter**, unlike the login route it mirrors. It needs a
+  valid admin access token, so anyone in a position to grind the current
+  password already holds an admin session, but it is a weaker check than sign in
+  and is listed here rather than left to be discovered.
+- **The account has no second factor**, and no recovery that does not involve a
+  shell on the host.
+
+---
+
+## 9. Key rotation
 
 All four keys live in the repo root `.env`. Generate a replacement the same way
 you generated the original, from `backend/`:
@@ -513,19 +694,36 @@ Every in-flight request at the moment of the restart fails once and retries.
 
 ### The admin password
 
-Use the CLI, from `backend/`:
+There are two ways to change it, and they are not equivalent.
+
+From inside the console, the key icon beside the username opens a dialog wired
+to `POST /api/admin/auth/change-password`. That verifies the current password,
+applies the same five rules registration applies, rehashes, and **revokes every
+admin refresh token, including the one the tab making the change is holding**.
+That is the point: a password change is what someone does when they think a
+session is not theirs any more, and it would be worth very little if the other
+tabs kept working. The caller signs in again with the new password.
+
+From a shell on the host, when the password is lost, use the CLI from
+`backend/`:
 
 ```powershell
 uv run python -m app.admin_cli reset-password --username alice
 ```
 
-This does not revoke existing admin refresh tokens. If the password was
-compromised, also clear that account's admin refresh rows:
+**The CLI does not revoke anything.** It replaces the hash and clears the
+lockout, and any admin session that is already open keeps working. If the
+password was compromised rather than merely forgotten, clear that account's
+admin refresh rows too:
 `DELETE FROM refresh_tokens WHERE subject = 'alice' AND kind = 'admin-refresh';`
+
+`create-admin` is no longer part of this path. It refuses once an account
+exists, printing "An admin account already exists. Use reset-password instead."
+and exiting 1, before it prompts for anything.
 
 ---
 
-## 9. `REQUIRE_SIGNED_REQUESTS=false` is development only
+## 10. `REQUIRE_SIGNED_REQUESTS=false` is development only
 
 Setting it false degrades every device-authenticated route to an app key plus a
 bearer token. Specifically, it removes:
@@ -553,7 +751,7 @@ is the second reason it must never reach a deployment.
 
 ---
 
-## 10. Known gaps in this build
+## 11. Known gaps in this build
 
 Listed here rather than buried, because a gap you know about is manageable.
 
@@ -572,9 +770,23 @@ Listed here rather than buried, because a gap you know about is manageable.
   by 5 per IP per hour.
 - **`X-Forwarded-For` is deliberately ignored**, so behind a proxy that is not
   configured with `--proxy-headers`, every caller shares one rate limit bucket.
-- **The admin console has one flat role.** Any admin can do anything, including
-  deleting articles and turning maintenance mode on. There are no roles and no
-  second factor.
+- **The admin console has one account and one flat role.** That account can do
+  anything, including deleting articles and turning maintenance mode on. There
+  are no roles, no second admin and no second factor, so there is no per-person
+  attribution in `audit_log` and no way to remove one person's access without
+  changing the password for everyone. See section 8.
+- **The bootstrap token is delivered by printing it to the console.** Until the
+  admin account exists, anyone who can reach the port and read that console can
+  claim the instance. Create the account before the API is exposed anywhere, and
+  remember that shipped logs and shared screens count as places the token has
+  been. See the warning in section 8.
+- **A closed registration route is not rate limited.** That is the price of
+  answering it identically to an unknown path: the budgets are charged after the
+  row count, so a caller hammering `POST /api/admin/auth/register` on a claimed
+  instance costs one `COUNT(*)` per request and nothing else.
+- **`change-password` is not rate limited and does not count toward the
+  lockout.** It is behind an admin bearer token, so grinding it needs a live
+  admin session, but it is a weaker check than the login route it mirrors.
 - **Rate limits are correctness-sized, not volume-sized.** They are SQLite
   writes on the request path.
 - **Images are hotlinked from publisher CDNs.** That is a deliberate MVP choice
@@ -582,7 +794,7 @@ Listed here rather than buried, because a gap you know about is manageable.
 
 ---
 
-## 11. Deployment checklist
+## 12. Deployment checklist
 
 Work through this before the API is reachable from the internet.
 
@@ -595,6 +807,9 @@ Work through this before the API is reachable from the internet.
       is reused from another environment.
 - [ ] `ADMIN_BOOTSTRAP_USERNAME` and `ADMIN_BOOTSTRAP_PASSWORD` are empty, and
       the admin account exists.
+- [ ] **The admin account was created before this deployment became reachable
+      from anywhere but the host.** Registration is guarded only by the token
+      the API prints to its console; see section 8.
 - [ ] `.env` is not in the image, the repository or the build log. The
       `.gitignore` covers it; confirm your deployment path does too.
 
@@ -629,8 +844,10 @@ Work through this before the API is reachable from the internet.
 
 **Accounts and operations**
 
-- [ ] The admin account was created with the CLI and has a password that is not
-      shared with anything else.
+- [ ] The one admin account has a password that is not shared with anything
+      else, and everyone who needs the console knows they are sharing it.
+- [ ] Whoever holds a shell on the host knows that
+      `uv run python -m app.admin_cli reset-password` is the only recovery path.
 - [ ] The database file and its `-wal` and `-shm` siblings are backed up and are
       not served by any web root.
 - [ ] Something in front of the API handles volume, because the token buckets do
@@ -644,6 +861,9 @@ Work through this before the API is reachable from the internet.
 - [ ] A signed request replayed a second time returns 401 `replayed_request`.
 - [ ] A device token presented to an admin route returns 401.
 - [ ] A wrong admin username and a wrong admin password return identical bodies.
+- [ ] `GET /api/admin/auth/status` answers `{"registration_open": false}`, and
+      `POST /api/admin/auth/register` answers the same 404 body as a path that
+      does not exist.
 - [ ] No secret, token, signature or password appears anywhere in the startup
       log or the request log.
 

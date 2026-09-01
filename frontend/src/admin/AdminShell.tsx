@@ -12,9 +12,25 @@
  *
  * The Toaster is mounted here, once. Sonner stacks and announces toasts itself,
  * and a second instance would duplicate every message.
+ *
+ * The account area is a cluster rather than a menu. There is exactly one admin
+ * account and exactly two things to do with it, so hiding both behind a
+ * dropdown would add a click and a focus handover to save no space, and the
+ * username has to stay visible anyway.
  */
 
-import { LayoutDashboard, Flag, LogOut, Moon, Newspaper, Sun, Workflow } from 'lucide-react';
+import { useState } from 'react';
+import {
+  KeyRound,
+  LayoutDashboard,
+  Flag,
+  LogOut,
+  Moon,
+  Newspaper,
+  Sun,
+  UserRound,
+  Workflow,
+} from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { ReactNode } from 'react';
 
@@ -22,6 +38,7 @@ import { Button } from '../components/ui/button';
 import { Toaster } from '../components/ui/sonner';
 import { useTheme } from '../lib/useTheme';
 import { cn } from '../lib/utils';
+import { ChangePasswordDialog } from './components/ChangePasswordDialog';
 import { MaintenanceBanner } from './components/maintenance';
 import { useAdminAuth } from './useAdminAuth';
 
@@ -86,6 +103,7 @@ export interface AdminShellProps {
 export function AdminShell({ route, onNavigate, children }: AdminShellProps): JSX.Element {
   const { username, logout } = useAdminAuth();
   const { theme, toggleTheme } = useTheme();
+  const [changingPassword, setChangingPassword] = useState(false);
 
   return (
     <div className="min-h-dvh bg-bg text-fg">
@@ -113,10 +131,25 @@ export function AdminShell({ route, onNavigate, children }: AdminShellProps): JS
               audit_log rows a destructive action will carry is not optional.
               Only the surrounding sentence collapses on a narrow viewport.
             */}
-            <span className="max-w-40 truncate text-sm text-muted-fg">
-              <span className="hidden sm:inline">Signed in as </span>
-              <span className="font-medium text-fg">{username ?? 'unknown'}</span>
-            </span>
+            <div className="flex items-center gap-1 rounded-md border border-border py-0.5 pl-2">
+              <UserRound aria-hidden="true" className="size-4 shrink-0 text-muted-fg" />
+              <span className="max-w-40 truncate text-sm text-muted-fg">
+                <span className="hidden sm:inline">Signed in as </span>
+                <span className="font-medium text-fg">{username ?? 'unknown'}</span>
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Change password"
+                title="Change password"
+                onClick={() => {
+                  setChangingPassword(true);
+                }}
+              >
+                <KeyRound aria-hidden="true" />
+              </Button>
+            </div>
             <Button
               type="button"
               variant="ghost"
@@ -187,6 +220,8 @@ export function AdminShell({ route, onNavigate, children }: AdminShellProps): JS
 
         <main className="min-w-0 flex-1">{children}</main>
       </div>
+
+      <ChangePasswordDialog open={changingPassword} onOpenChange={setChangingPassword} />
 
       <Toaster />
     </div>

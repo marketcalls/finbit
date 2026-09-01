@@ -96,6 +96,15 @@ to call it. The full design is in [SECURITY.md](SECURITY.md); the short version:
 - **Mobile app.** An Expo SDK 54 build sharing the design tokens, the wire types
   and the signing code with the web app.
 
+### What phase 3 added
+
+The admin account is no longer created from the command line. It is created
+once, in the browser, guarded by a token the API prints to its console while no
+account exists. Registration closes permanently the moment it succeeds, and the
+closed route answers 404 rather than 403, so it cannot be found once it is gone.
+The console also gained a change-password dialog, which ends every admin session
+including its own. The CLI stays as the recovery path for a forgotten password.
+
 ---
 
 ## Requirements
@@ -197,29 +206,90 @@ Set `EXPO_PUBLIC_APP_KEY` in `mobile/.env` to the same value you put in
 Add packages with `npx expo install <pkg>`, never `npm install <pkg>`, so Expo
 resolves the SDK 54 compatible version.
 
-### 6. The first admin account
+### 6. The one admin account, created on first run
 
-There is no HTTP route that creates an administrator, on purpose: an endpoint
-that can mint one is an endpoint someone can find. Run the CLI from `backend/`:
+FinBit has **exactly one admin account for the life of the deployment**. There
+is no invite, no second account, no pending queue, no roles and no route that
+can create another one. Whoever needs the console shares that account.
 
-```powershell
-uv run python -m app.admin_cli create-admin --username alice
+It is created once, in the browser, the first time you run the API. Start the
+backend (the next section) and watch the console it is running in. While
+`admin_users` is empty, startup mints a one-time bootstrap token and prints it:
+
+```
+2026-09-01 22:13:26,361 INFO finbit.api
+============================================================
+  FinBit: no admin account exists.
+  Open the web app at /#/admin and create it.
+  Bootstrap token: rygW1T-QUTug9-sRtzQ0-5azYls
+  Valid for 30 minutes. Printed once per start.
+============================================================
 ```
 
-It prompts for the password twice on stdin. The password is never echoed, never
-lands in shell history and never reaches a log line. Minimum length is 12
-characters.
+That console is the only place the token ever appears. It is not written to the
+database, not written to a file, and no endpoint returns it.
 
-The other two subcommands:
+Then start the frontend and open <http://localhost:5173/#/admin>. The screen
+asks the API whether an account exists yet and shows the registration form:
+username, password, confirm password, and that token. Dashes and stray
+whitespace in the token are ignored, so paste it however it landed on your
+clipboard. On success the browser is already signed in and goes straight to the
+dashboard.
+
+After that the registration route is gone for good. `GET
+/api/admin/auth/status` answers `{"registration_open": false}`, and `POST
+/api/admin/auth/register` answers 404 with the same body any unknown path
+returns.
+
+Four things worth knowing before you get there:
+
+- **The token is valid for 30 minutes.** If it lapses before you reach the form,
+  restart the API and use the one the new process prints. An expired token is
+  refused exactly like a wrong one, with no hint about which it was.
+- **`uvicorn --reload` reprints it on every save** while no admin exists. That
+  is expected rather than a bug: each reload is a fresh process, so it mints a
+  fresh token and the previous one dies with the process that printed it. Once
+  the account exists, a restart prints nothing and mints nothing.
+- **Whoever can read that console can claim this instance.** Create the account
+  before you put port 8000 on a dev tunnel or a forwarded port. See
+  [SECURITY.md](SECURITY.md).
+- **The rules the form applies** are enforced by the server and mirrored live on
+  screen: the password is at least 12 characters, contains at least one letter
+  and one digit, is not the same as the username, and is not one of a small list
+  of obvious passwords. The username is 3 to 32 characters of letters, digits,
+  dots, underscores and hyphens, stored lowercase and compared
+  case-insensitively.
+
+Once signed in, the key icon beside the username in the admin header changes the
+password. That revokes every admin refresh token, including the one the tab you
+are sitting in holds, so you sign in again with the new password.
+
+#### If the password is lost
+
+The CLI is the recovery path, and it deliberately needs a shell on the host,
+which is a higher bar than any HTTP route could offer. From `backend/`:
 
 ```powershell
-uv run python -m app.admin_cli list-admins
 uv run python -m app.admin_cli reset-password --username alice
+uv run python -m app.admin_cli list-admins
 ```
 
-Alternatively, set `ADMIN_BOOTSTRAP_USERNAME` and `ADMIN_BOOTSTRAP_PASSWORD` in
-`.env`. When both are set and no admin exists yet, startup creates that one
-account and logs the username only. Clear both variables afterwards so the
+`reset-password` prompts for the new password twice on stdin. It is never
+echoed, never lands in shell history and never reaches a log line. Minimum
+length is 12 characters.
+
+`create-admin` still exists, but it now refuses once an account exists: it
+prints "An admin account already exists. Use reset-password instead." and exits
+1, before it prompts for anything. It is only usable on a database that has no
+admin yet, where the browser flow is the intended route anyway.
+
+#### Creating the account without a browser
+
+`ADMIN_BOOTSTRAP_USERNAME` and `ADMIN_BOOTSTRAP_PASSWORD` in `.env` still work.
+When both are set and no admin exists yet, startup creates that one account and
+logs the username only. In that case no bootstrap token is minted and nothing is
+printed, because the account already exists by the time the first request
+arrives and registration is closed. Clear both variables afterwards so the
 password is not sitting in a file.
 
 ---
@@ -238,9 +308,14 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 Binding `0.0.0.0` rather than `127.0.0.1` is what lets a phone on the same Wi-Fi
 reach the API. Startup creates the schema, applies the phase 2 migration, checks
-that the four secrets are real, seeds the feature flag defaults, starts the
-scheduler and, when the database is empty or stale, fires one seeding cycle.
-Interactive documentation is at <http://127.0.0.1:8000/docs>.
+that the four secrets are real, seeds the feature flag defaults, prints the
+bootstrap token when there is no admin account yet, starts the scheduler and,
+when the database is empty or stale, fires one seeding cycle. Interactive
+documentation is at <http://127.0.0.1:8000/docs>.
+
+`0.0.0.0` also means everyone on that network can reach the API. On a shared or
+untrusted one, bind `127.0.0.1` until the admin account exists, because
+registration is open to anyone who can reach the port and read the token.
 
 ### Frontend
 
@@ -371,6 +446,11 @@ EXPO_PUBLIC_API_URL=https://your-api-tunnel-host
 
 Then restart `npx expo start --tunnel`.
 
+**Create the admin account before you start that API tunnel.** A tunnel makes
+port 8000 reachable from the internet, and while no admin account exists the
+registration route is open to whoever reaches it and can read the bootstrap
+token. Claim it first, over localhost; see step 6 of the setup.
+
 **Add that tunnel origin to `CORS_ORIGINS` in the repo root `.env`.** CORS does
 not apply to the native app, which is not a browser, but it does apply the
 moment a browser is involved: the Expo web build (`press w`), the Vite app
@@ -387,10 +467,12 @@ The list is explicit and never a wildcard. Restart the API after changing it.
 
 ## The admin console
 
-Open <http://localhost:5173/#/admin> and sign in with the account you created
-with the CLI. The console is loaded with `React.lazy`, so a reader of the public
-feed never downloads it. The session lives in memory plus `sessionStorage`,
-which means closing the tab ends it.
+Open <http://localhost:5173/#/admin> and sign in. On an instance that has no
+admin account yet, the same screen offers the one-time registration form
+instead; see [step 6](#6-the-one-admin-account-created-on-first-run). The
+console is loaded with `React.lazy`, so a reader of the public feed never
+downloads it. The session lives in memory plus `sessionStorage`, which means
+closing the tab ends it.
 
 | Screen | Hash | What it controls |
 | --- | --- | --- |
@@ -399,10 +481,14 @@ which means closing the tab ends it.
 | Content | `#/admin/content` | The article table with search, category filter and hidden or pinned filters. Row actions: hide, pin, edit, re-score, refresh image, delete, view cluster |
 | Flags | `#/admin/flags` | A switch per category and per market filter, the default sort, maintenance mode with its message, and a minimum mobile version |
 
-Two things worth knowing:
+Four things worth knowing:
 
 - **Buttons that spend money say so.** Fetch now states the cost estimate next
   to it and asks for confirmation before it runs. Deleting an article asks too.
+- **One account, one role.** Every action is taken by the single admin account
+  and lands in `audit_log` under that name. The key icon next to the username
+  changes the password, which signs out every admin session including the one
+  making the change.
 - **Pipeline changes take effect without a restart.** The settings written here
   land in `app_settings`, which overrides `.env` at runtime, and the scheduler
   re-reads the interval on every tick.
@@ -421,11 +507,15 @@ Backend, from `backend/`:
 uv run pytest
 ```
 
-284 tests: 283 pass and 1 is an expected failure. They cover the API surface,
+327 tests: 326 pass and 1 is an expected failure. They cover the API surface,
 dedupe scoring, the importance formula, Open Graph extraction over saved HTML,
 the whole signing and replay layer with fixed cross-language vectors, the device
 handshake and bookmark isolation, and every admin route including lockout, the
-audit log and the maintenance gate. Nothing in the suite hits the network.
+audit log and the maintenance gate. The one-time registration has its own file,
+`tests/test_admin_register.py`: the closed route answering bytes identical to an
+unknown path, the bootstrap token's expiry and normalization, every password
+rule, the CLI refusal, and two threads racing through the same insert to prove
+only one account can appear. Nothing in the suite hits the network.
 
 Shared package and web, from `packages/shared/` and `frontend/`:
 
@@ -476,9 +566,12 @@ device secret yet. See [SECURITY.md](SECURITY.md) for the exact rules.
 
 | Route | Purpose |
 | --- | --- |
+| `GET /admin/auth/status` | Public, no auth. One boolean: whether the one-time registration is still open |
+| `POST /admin/auth/register` | Public, guarded by the bootstrap token. Creates the one admin account and returns a signed-in session. 404 once that account exists |
 | `POST /admin/auth/login` | Sign in, returns an access token and a rotating refresh token |
 | `POST /admin/auth/refresh` | Rotate an admin refresh token |
 | `POST /admin/auth/logout` | 204, revokes the refresh token |
+| `POST /admin/auth/change-password` | 204, rehashes the password and revokes every admin refresh token |
 | `GET /admin/auth/me` | The signed in username and last login time |
 | `GET /admin/pipeline` | Settings, scheduler state, whether ingest can run, and the last five runs |
 | `PATCH /admin/pipeline` | Change any subset of the overridable pipeline settings |
@@ -570,7 +663,7 @@ the database.
 | `APP_KEY_WEB` | placeholder | The app key the web bundle carries. Public by definition |
 | `DEVICE_MASTER_KEY` | placeholder | Every device secret is derived from this. A real secret. Rotating it invalidates every device |
 | `JWT_SECRET` | placeholder | Signs access tokens. A real secret. Rotating it signs everyone out |
-| `ADMIN_BOOTSTRAP_USERNAME` | empty | Optional. With the password below, creates the first admin at startup when none exists |
+| `ADMIN_BOOTSTRAP_USERNAME` | empty | Optional. With the password below, creates the one admin at startup when none exists, in which case no bootstrap token is minted or printed |
 | `ADMIN_BOOTSTRAP_PASSWORD` | empty | Optional. Only the username is ever logged |
 | `SIGNATURE_SKEW_SECONDS` | `120` | How far a signed timestamp may be from the server clock |
 | `NONCE_TTL_SECONDS` | `300` | How long a nonce is remembered before it is pruned |
@@ -608,6 +701,8 @@ finbit/
   .env.example                  environment template, all keys annotated
   CONTRACT.md                   phase 1 build contract
   CONTRACT_MOBILE_ADMIN.md      phase 2 build contract, mobile and admin
+  CONTRACT_ADMIN_REGISTRATION.md
+                                phase 3 build contract, the one admin account
   SECURITY.md                   threat model, signing, rotation, deployment
   packages/shared/              one API contract for both web and mobile
     src/types.ts                every request and response type
@@ -621,13 +716,15 @@ finbit/
       main.py                   FastAPI app, lifespan, middleware, routers
       config.py                 settings, and the startup security check
       deps.py                   the signed-request verification chain
-      admin_cli.py              create-admin, list-admins, reset-password
+      admin_cli.py              list-admins, reset-password, create-admin
+                                (which refuses once an account exists)
       migrate.py                idempotent ALTER TABLE additions
       models.py                 Pydantic models and the fixed vocabularies
       db.py, repo.py            connection handling and every SQL statement
       schema.sql                tables, indexes and the FTS5 index
-      security/                 app keys, signing, tokens, passwords,
-                                rate limits, transport middleware
+      security/                 app keys, signing, tokens, passwords, rate
+                                limits, transport middleware, and bootstrap.py,
+                                the in-memory one-time registration token
       routers/                  feed, search, bookmarks, meta, config,
                                 device auth, admin auth, admin pipeline,
                                 admin content, admin flags

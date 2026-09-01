@@ -1830,6 +1830,76 @@ def list_audit(limit: int = DEFAULT_AUDIT_LIMIT) -> list[dict[str, Any]]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Admin accounts (CONTRACT_ADMIN_REGISTRATION.md sections 3.1 to 3.3)
+# ---------------------------------------------------------------------------
+
+
+def admin_account_count() -> int:
+    """How many admin accounts exist. The whole of the registration gate."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM admin_users").fetchone()
+    return int(row["n"] if row is not None else 0)
+
+
+def registration_open() -> bool:
+    """True only while admin_users is empty (section 3.1)."""
+    return admin_account_count() == 0
+
+
+def create_first_admin(
+    username: str, password_hash: str, created_at: str | None = None
+) -> bool:
+    """Insert the one admin account, but only while there is none.
+
+    Returns True when this call created it and False when it lost the race to
+    another caller. False is not an error: the router answers it with the same
+    404 any late caller gets, because by then the route genuinely is closed.
+
+    Two different races are covered, and they need two different locks.
+    get_conn(write=True) holds the process write lock, which is what stops two
+    threads of one uvicorn worker from interleaving. BEGIN IMMEDIATE takes
+    SQLite's write lock on the file before the count is read, which is what
+    stops two separate processes on the same database from both seeing zero.
+    Counting inside that transaction rather than before it is the point: a
+    count read outside the write lock is a number that can already be stale by
+    the time the insert runs.
+
+    The UNIQUE constraint on username is caught as well, so a second account
+    can never appear through this function even if the count were somehow
+    wrong.
+    """
+    with get_conn(write=True) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT COUNT(*) AS n FROM admin_users").fetchone()
+        if int(row["n"] if row is not None else 0):
+            return False
+        try:
+            conn.execute(
+                "INSERT INTO admin_users (username, password_hash, created_at, "
+                "failed_count) VALUES (?, ?, ?, 0)",
+                (username, password_hash, created_at or utcnow_iso()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+    return True
+
+
+def set_admin_password(username: str, password_hash: str) -> bool:
+    """Replace an admin password hash and clear any lockout.
+
+    Returns False when there is no such row. Takes an already hashed value, so
+    a plaintext password never reaches this module at all.
+    """
+    with get_conn(write=True) as conn:
+        cursor = conn.execute(
+            "UPDATE admin_users SET password_hash = ?, failed_count = 0, "
+            "locked_until = NULL WHERE username = ?",
+            (password_hash, username),
+        )
+        return bool(cursor.rowcount)
+
+
 __all__ = [
     "DEFAULT_ADMIN_ARTICLE_LIMIT",
     "DEFAULT_AUDIT_LIMIT",
@@ -1847,6 +1917,7 @@ __all__ = [
     "MAX_SEARCH_LIMIT",
     "TRENDING_WINDOW_HOURS",
     "add_bookmark",
+    "admin_account_count",
     "admin_get_article",
     "admin_list_articles",
     "all_app_settings",
@@ -1855,13 +1926,16 @@ __all__ = [
     "articles_needing_images",
     "bookmarked_ids_for_device",
     "category_counts",
+    "create_first_admin",
     "delete_app_setting",
     "get_app_setting",
     "get_feature_flag",
     "list_audit",
     "mark_moderated",
+    "registration_open",
     "reset_moderation_cache",
     "seed_feature_flags",
+    "set_admin_password",
     "set_app_setting",
     "set_feature_flag",
     "write_audit",
