@@ -28,6 +28,7 @@ import {
   createApiClient,
   isAbortError,
   type ApiClient,
+  type AppId,
   type DevicePlatform,
 } from '@finbit/shared';
 
@@ -72,13 +73,29 @@ function resolveBaseUrl(): string {
 /** Where this build talks to. Shown on the Settings screen in development. */
 export const API_BASE_URL = resolveBaseUrl();
 
-const APP_KEY = process.env.EXPO_PUBLIC_APP_KEY ?? '';
+/*
+  The server pairs an app key with an app id and allows each one only its own
+  platforms: 'mobile' may register ios and android, 'web' may register web
+  (backend/app/security/keys.py, PLATFORMS_BY_APP_ID). This bundle runs on all
+  three, so it presents the identity that matches where it is running rather
+  than one fixed pair. Both keys ship in the bundle, which changes nothing: they
+  are public by definition, as SECURITY.md says.
+*/
+const IS_WEB = Platform.OS === 'web';
+
+const APP_KEY_MOBILE = process.env.EXPO_PUBLIC_APP_KEY ?? '';
+const APP_KEY_WEB = process.env.EXPO_PUBLIC_APP_KEY_WEB ?? '';
+
+const APP_ID: AppId = IS_WEB ? 'web' : 'mobile';
+const APP_KEY = IS_WEB ? APP_KEY_WEB : APP_KEY_MOBILE;
 
 if (APP_KEY === '' && __DEV__) {
   // Naming the variable is safe; its value is never logged.
+  const variable = IS_WEB ? 'EXPO_PUBLIC_APP_KEY_WEB' : 'EXPO_PUBLIC_APP_KEY';
+  const source = IS_WEB ? 'APP_KEY_WEB' : 'APP_KEY_MOBILE';
   console.warn(
-    'FinBit: EXPO_PUBLIC_APP_KEY is not set, so every request will be refused. ' +
-      'Copy mobile/.env.example to mobile/.env and set it to APP_KEY_MOBILE from the backend .env.',
+    `FinBit: ${variable} is not set, so every request will be refused. ` +
+      `Copy mobile/.env.example to mobile/.env and set it to ${source} from the backend .env.`,
   );
 }
 
@@ -100,9 +117,10 @@ function devicePlatform(): DevicePlatform {
 export const api: ApiClient = createApiClient({
   baseUrl: API_BASE_URL,
   appKey: APP_KEY,
-  // Always 'mobile', including the web preview, because that is the key this
-  // bundle carries and the server checks that the two agree.
-  appId: 'mobile',
+  // 'web' when this bundle runs in a browser, 'mobile' on a device. It must
+  // agree with the key above and with the platform below, or the server
+  // refuses registration.
+  appId: APP_ID,
   platform: devicePlatform(),
   store: createCredentialStore(),
   // expo-crypto reads the platform CSPRNG. Math.random would make nonces
